@@ -1,0 +1,20 @@
+# UEFN / Unreal generated
+Binaries/
+Build/
+DerivedDataCache/
+Intermediate/
+Saved/
+.vs/
+*.VC.db
+*.opensdf
+*.opendb
+*.sdf
+*.suo
+
+# Verse build artifacts
+.vscode/
+*.vproject.local
+
+# OS
+.DS_Store
+Thumbs.db
