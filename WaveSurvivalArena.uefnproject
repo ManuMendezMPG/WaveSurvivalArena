@@ -1,0 +1,77 @@
+{
+	"fileVersion": 15,
+	"title": "WaveSurvivalArena",
+	"description": "",
+	"keyArt": "Resources/SceneGraph.png",
+	"docsUrl": "",
+	"apiAccess": "Private",
+	"bindings":
+	{
+		"projectId": "6330b9f8-4011-ea71-11fc-5b927216b366",
+		"modules":
+		{
+			"WaveSurvivalArena": "893bccbf-415d-c05c-8156-c592636d943b"
+		},
+		"bSuppressAutomaticVersePathAssignment": false,
+		"projectVersePath": ""
+	},
+	"compatibilityVersion": "41.20",
+	"requiredRedirectorStartingVersion": "41.20.55550516",
+	"editorPermissions": [],
+	"epicApp": "",
+	"sortPriority": 0,
+	"featureSet": "",
+	"plugins": [
+		{
+			"name": "WaveSurvivalArena",
+			"bIsRoot": true,
+			"bIsPublic": false
+		}
+	],
+	"dataSets":
+	{
+		"matchmaking":
+		{
+			"maxPlayers": 16,
+			"maxTeamCount": 16,
+			"maxTeamSize": 16,
+			"maxSocialPartySize": 16,
+			"allowJoinInProgress": true,
+			"allowSquadFillOption": false,
+			"islandQueuePrivacy": "Unrestricted",
+			"minPlayers": 1,
+			"overtimePlayerTarget": 1,
+			"queueMainDuration": 5,
+			"queueOvertimeDuration": 5,
+			"useSkillBasedMatchmaking": false,
+			"ratingType": "",
+			"version": 1
+		},
+		"experimental":
+		{
+			"sceneGraph":
+			{
+				"bIsSceneGraphSystemAllowed": true,
+				"bEnableOneFilePerEntity": false
+			},
+			"inventory":
+			{
+				"bIsCustomInventoryAllowed": false
+			},
+			"physics":
+			{
+				"bShouldEnableToggle": true,
+				"bIsExperimentalPhysicsEnabled": false
+			},
+			"version": 1,
+			"sceneGraphExperimentalFeatures":
+			{
+				"bAreSceneGraphExperimentalFeaturesAllowed": false
+			},
+			"scriptableTools":
+			{
+				"bIsScriptableToolsEnabled": false
+			}
+		}
+	}
+}
