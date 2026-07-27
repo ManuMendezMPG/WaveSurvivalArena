@@ -76,6 +76,31 @@ wave_manager := class(creative_device):
         # fires and calls OnStartPressed, passing along the interacting agent.
         StartButton.InteractedWithEvent.Subscribe(OnStartPressed)
 
+    # Removes the enemies of the previous wave from the world and forgets them.
+    #
+    # This is what defines a "wave" as "the enemies currently alive": each
+    # button press wipes the previous batch before spawning the next, so the
+    # world never holds more than EnemiesPerWave enemies and successive waves
+    # do not pile up on the same spot.
+    ClearCurrentWave() : void =
+        # Read the count BEFORE clearing, so the log can report it.
+        RemovedCount : int = SpawnedEnemies.Length
+
+        for (Enemy : SpawnedEnemies):
+            # RemoveFromParent is the Scene Graph way to take an entity out of
+            # the world - it is the counterpart of AddEntities and the same call
+            # the SpawnPrefabDevice.verse sample uses to despawn.
+            # It is NOT failable (returns void, no `[]`), so it needs no guard,
+            # and it cascades: the prefab's child entities and components run
+            # their OnEndSimulation too, so the whole light post disappears.
+            Enemy.RemoveFromParent()
+
+        # Drop every reference. `array{}` is an empty array literal; its type is
+        # inferred from the field, which is already declared as []entity.
+        set SpawnedEnemies = array{}
+
+        Print("Cleared previous wave - {RemovedCount} enemies removed")
+
     # The event handler. Its signature must match what the event sends:
     # InteractedWithEvent sends an `agent`, so we receive one here.
     # (`InAgent` is the value; `agent` is the type — Verse is case-sensitive.)
@@ -85,6 +110,12 @@ wave_manager := class(creative_device):
     # SetGlobalTransform); it is just wrapped in a loop now.
     OnStartPressed(InAgent : agent) : void =
         Print("Start button pressed - spawning a wave of {EnemiesPerWave} enemies")
+
+        # Wipe the previous wave FIRST, then spawn the new one. Clearing does
+        # not depend on either guard below: on the very first press the array is
+        # empty and this is a no-op.
+        ClearCurrentWave()
+
         # GetSimulationEntity[] returns the ROOT of the Scene Graph world.
         # It is failable (note the [] brackets), so we guard it with `if`.
         # We add spawned entities as children of this root.
@@ -139,7 +170,9 @@ wave_manager := class(creative_device):
 
                     set CurrentOffset += EnemySpacing
 
-                Print("Wave spawned - {EnemiesPerWave} enemies placed in a row from the SpawnMarker ({SpawnedEnemies.Length} tracked in total)")
+                # Now that each wave clears the previous one, SpawnedEnemies.Length
+                # is the live enemy count, not a running total.
+                Print("Wave spawned - {SpawnedEnemies.Length} enemies now alive, in a row from the SpawnMarker")
             else:
                 Print("WARNING: SpawnMarker is not assigned - place a prop in the level and assign it in the wave_manager Details panel")
         else:
