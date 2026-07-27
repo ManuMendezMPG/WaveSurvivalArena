@@ -49,6 +49,21 @@ wave_manager := class(creative_device):
     @editable
     SpawnMarker : creative_prop = creative_prop{}
 
+    # HOW MANY enemies one button press spawns. Editable so the wave size can
+    # be tuned from the Details panel without recompiling Verse.
+    @editable
+    EnemiesPerWave : int = 5
+
+    # Distance in centimeters between two consecutive enemies in the row.
+    # Also editable so the spacing can be eyeballed in-game and adjusted.
+    @editable
+    EnemySpacing : float = 200.0
+
+    # Every entity spawned so far. `var` makes the field mutable; `[]entity` is
+    # the Scene Graph entity array type (same one AddEntities takes).
+    # Phase 2 only fills it - the live-enemy count will read it later.
+    var SpawnedEnemies : []entity = array{}
+
     # OnBegin runs ONCE when the game starts. `<override>` says we are
     # replacing the empty base version defined in creative_device.
     # `<suspends>` marks this as an async function: it is allowed to
@@ -65,10 +80,11 @@ wave_manager := class(creative_device):
     # InteractedWithEvent sends an `agent`, so we receive one here.
     # (`InAgent` is the value; `agent` is the type — Verse is case-sensitive.)
     #
-    # Phase 2, minimal step: spawn ONE enemy entity via Scene Graph.
-    # This reuses the exact spawn pattern from SpawnPrefabDevice.verse.
+    # Phase 2: spawn a WAVE of enemy entities via Scene Graph. The per-enemy
+    # spawn mechanism is unchanged (GetSimulationEntity -> AddEntities ->
+    # SetGlobalTransform); it is just wrapped in a loop now.
     OnStartPressed(InAgent : agent) : void =
-        Print("Start button pressed - spawning one enemy")
+        Print("Start button pressed - spawning a wave of {EnemiesPerWave} enemies")
         # GetSimulationEntity[] returns the ROOT of the Scene Graph world.
         # It is failable (note the [] brackets), so we guard it with `if`.
         # We add spawned entities as children of this root.
@@ -82,29 +98,48 @@ wave_manager := class(creative_device):
             if:
                 SpawnMarker.IsValid[]
             then:
-                # Instantiate a prefab. A prefab is a pre-assembled entity
-                # (mesh + components). `LightPost.P_LightPost{}` is used here as
-                # a visible PLACEHOLDER enemy until we build a real enemy prefab.
-                Enemy : entity = LightPost.P_LightPost{}
+                # Read the marker's position ONCE, outside the loop: it is the
+                # anchor every enemy is placed relative to.
+                # GetGlobalTransform() (NOT GetTransform()) returns a
+                # /Verse.org/SpatialMath transform, so its Translation is
+                # already a LUF vector3 and needs no conversion.
+                MarkerTranslation : vector3 = SpawnMarker.GetGlobalTransform().Translation
 
-                # AddEntities inserts the new entity into the live world.
-                # Until this call, the prefab exists but is not "in the scene".
-                SimulationEntity.AddEntities(array{ Enemy })
-
-                # Read the marker's position. GetGlobalTransform() (NOT
-                # GetTransform()) returns a /Verse.org/SpatialMath transform,
-                # so its Translation is already a LUF vector3 and feeds
-                # SetGlobalTransform directly, with no conversion.
+                # Placement pattern: a straight row along the LEFT axis.
+                # Enemy 0 lands exactly on the marker, and each following one is
+                # EnemySpacing centimeters further along Left. Up and Forward are
+                # copied from the marker untouched, so the whole row shares its
+                # height and depth and nobody floats or sinks.
                 #
-                # We take ONLY Translation and rebuild the transform, so the
-                # enemy ignores whatever rotation/scale the marker prop happens
-                # to have and keeps identity rotation + scale 1 (upright, full
-                # size). No offset for now: it spawns exactly on the marker.
-                SpawnTranslation : vector3 = SpawnMarker.GetGlobalTransform().Translation
-                SpawnTransform : transform = transform{ Translation := SpawnTranslation }
-                Enemy.SetGlobalTransform(SpawnTransform)
+                # The offset is accumulated instead of computed as
+                # `Index * EnemySpacing`: Index is an int and EnemySpacing a
+                # float, and Verse has no implicit int-to-float conversion.
+                var CurrentOffset : float = 0.0
 
-                Print("Enemy spawned at the SpawnMarker position")
+                for (Index := 0..EnemiesPerWave - 1):
+                    # Instantiate a prefab. A prefab is a pre-assembled entity
+                    # (mesh + components). `LightPost.P_LightPost{}` is used here
+                    # as a visible PLACEHOLDER until we build a real enemy prefab.
+                    Enemy : entity = LightPost.P_LightPost{}
+
+                    # AddEntities inserts the new entity into the live world.
+                    # Until this call, the prefab exists but is not "in the scene".
+                    SimulationEntity.AddEntities(array{ Enemy })
+
+                    # We build the translation field by field and rebuild the
+                    # transform from scratch, so each enemy ignores whatever
+                    # rotation/scale the marker prop happens to have and keeps
+                    # identity rotation + scale 1 (upright, full size).
+                    SpawnTranslation : vector3 = vector3{ Left := MarkerTranslation.Left + CurrentOffset, Up := MarkerTranslation.Up, Forward := MarkerTranslation.Forward }
+                    SpawnTransform : transform = transform{ Translation := SpawnTranslation }
+                    Enemy.SetGlobalTransform(SpawnTransform)
+
+                    # Track it for the future live-enemy count.
+                    set SpawnedEnemies += array{ Enemy }
+
+                    set CurrentOffset += EnemySpacing
+
+                Print("Wave spawned - {EnemiesPerWave} enemies placed in a row from the SpawnMarker ({SpawnedEnemies.Length} tracked in total)")
             else:
                 Print("WARNING: SpawnMarker is not assigned - place a prop in the level and assign it in the wave_manager Details panel")
         else:
