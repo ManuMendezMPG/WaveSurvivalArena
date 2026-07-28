@@ -165,6 +165,35 @@ wave_manager := class(creative_device):
                     SpawnTransform : transform = transform{ Translation := SpawnTranslation }
                     Enemy.SetGlobalTransform(SpawnTransform)
 
+                    # Give the enemy its health.
+                    #
+                    # A component must be told its parent entity AT CONSTRUCTION:
+                    # the digest states components "must have a parent entity
+                    # pointer provided when being constructed" and can never be
+                    # moved between parents. That is why `Entity` is the only
+                    # field of `component` without a default value.
+                    #
+                    # This runs AFTER AddEntities and AFTER SetGlobalTransform on
+                    # purpose. Per the AddComponents docs, OnBeginSimulation fires
+                    # immediately when the entity is already simulating, so doing
+                    # it last means the component starts up with the enemy already
+                    # at its final position. Irrelevant for health, but it is the
+                    # right habit before movement/range components arrive.
+                    NewHealthComp : health_component = health_component{ Entity := Enemy }
+                    Enemy.AddComponents(array{ NewHealthComp })
+
+                    # Read the component BACK OFF the entity instead of reusing
+                    # NewHealthComp. That is deliberate: it proves the
+                    # entity -> component lookup works, which is the mechanism the
+                    # live-enemy count will depend on. We keep no parallel array of
+                    # components; the entity is the single source of truth.
+                    if:
+                        AttachedHealthComp := Enemy.GetComponent[health_component]
+                    then:
+                        Print("Enemy {Index} has a health_component with {AttachedHealthComp.MaxHealth} max health")
+                    else:
+                        Print("WARNING: enemy {Index} has no health_component after AddComponents")
+
                     # Track it for the future live-enemy count.
                     set SpawnedEnemies += array{ Enemy }
 
