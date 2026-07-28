@@ -53,10 +53,21 @@ wave_manager := class(creative_device):
     @editable
     SpawnMarker : creative_prop = creative_prop{}
 
-    # HOW MANY enemies one button press spawns. Editable so the wave size can
-    # be tuned from the Details panel without recompiling Verse.
+    # Size of wave 1. Later waves derive their size from this - see StartWave.
     @editable
     EnemiesPerWave : int = 5
+
+    # Extra enemies added per wave: 5, 7, 9, 11... with the defaults.
+    @editable
+    EnemiesIncrementPerWave : int = 2
+
+    # Waves needed to win. Clearing this many ends the run instead of chaining.
+    @editable
+    MaxWaves : int = 5
+
+    # Seconds of breathing room between clearing a wave and the next one.
+    @editable
+    TimeBetweenWaves : float = 3.0
 
     # Distance in centimeters between two consecutive enemies in the row.
     # Also editable so the spacing can be eyeballed in-game and adjusted.
@@ -85,6 +96,20 @@ wave_manager := class(creative_device):
     # assign it.
     var LiveEnemyCount : int = 0
 
+    # Which wave is running (1-based). Drives difficulty and the log messages.
+    var CurrentWaveNumber : int = 0
+
+    # Monotonic stamp bumped by EVERY StartWave call and never reset. Watchers
+    # and the chaining task capture it and compare before acting, so anything
+    # belonging to a previous wave becomes a no-op.
+    #
+    # This exists instead of comparing CurrentWaveNumber because wave numbers
+    # REPEAT: press Start while a chain is sleeping and CurrentWaveNumber goes
+    # back to 1, which the sleeping chain would read as "still my wave" and it
+    # would then overwrite the wave you just asked for. A number that only ever
+    # increases cannot be confused that way.
+    var WaveGeneration : int = 0
+
     # OnBegin runs ONCE when the game starts. `<override>` says we are
     # replacing the empty base version defined in creative_device.
     # `<suspends>` marks this as an async function: it is allowed to
@@ -100,10 +125,11 @@ wave_manager := class(creative_device):
 
     # Removes the enemies of the previous wave from the world and forgets them.
     #
-    # This is what defines a "wave" as "the enemies currently alive": each
-    # button press wipes the previous batch before spawning the next, so the
-    # world never holds more than EnemiesPerWave enemies and successive waves
-    # do not pile up on the same spot.
+    # Called by StartWave before every spawn, so one wave's leftovers can never
+    # pile up on the next one. With automatic chaining this is usually a no-op
+    # on already-dead entities: the next wave only starts once the previous one
+    # is at zero. It only really removes living enemies when the player presses
+    # Start mid-wave.
     ClearCurrentWave() : void =
         # Read the count BEFORE clearing, so the log can report it.
         RemovedCount : int = SpawnedEnemies.Length
@@ -137,16 +163,40 @@ wave_manager := class(creative_device):
     # InteractedWithEvent sends an `agent`, so we receive one here.
     # (`InAgent` is the value; `agent` is the type — Verse is case-sensitive.)
     #
-    # Phase 2: spawn a WAVE of enemy entities via Scene Graph. The per-enemy
-    # spawn mechanism is unchanged (GetSimulationEntity -> AddEntities ->
-    # SetGlobalTransform); it is just wrapped in a loop now.
+    # The button only kicks off the sequence at wave 1; every later wave is
+    # chained automatically by ChainNextWave. Pressing it again always restarts
+    # from wave 1, including after a victory - StartWave has no precondition.
     OnStartPressed(InAgent : agent) : void =
-        Print("Start button pressed - spawning a wave of {EnemiesPerWave} enemies")
+        Print("Start button pressed - restarting the run at wave 1")
+        StartWave(1)
 
-        # Wipe the previous wave FIRST, then spawn the new one. Clearing does
-        # not depend on either guard below: on the very first press the array is
-        # empty and this is a no-op.
+    # Spawns wave `WaveNumber`. THE single spawn path: both the button and the
+    # automatic chaining go through here, so the spawn logic exists once.
+    #
+    # ATOMICITY - this is load-bearing. This function contains no suspension
+    # point (no Await, no Sleep), and Verse is cooperatively scheduled on a
+    # single thread. So it runs start to finish without any watcher, damage
+    # press or chain task interleaving. That is what makes the sequence
+    # clear -> restamp -> spawn -> set count safe without any locking.
+    StartWave(WaveNumber : int) : void =
+        # 1. Sweep the previous wave out of the world first, so nothing old is
+        #    left behind and LiveEnemyCount starts from a known 0.
         ClearCurrentWave()
+
+        # 2. Establish the new identity BEFORE any watcher for this wave exists,
+        #    so every watcher below is stamped with the correct generation and
+        #    anything still holding the old stamp is now invalid.
+        set WaveGeneration += 1
+        set CurrentWaveNumber = WaveNumber
+        ThisGeneration : int = WaveGeneration
+
+        # 3. Derive the size from the wave number rather than accumulating it in
+        #    a variable: wave 1 -> EnemiesPerWave, and each wave after adds
+        #    EnemiesIncrementPerWave. Pure integer arithmetic, and re-tuning the
+        #    editable values re-shapes the whole progression from the next wave.
+        EnemyCount : int = EnemiesPerWave + (WaveNumber - 1) * EnemiesIncrementPerWave
+
+        Print("--- Wave {WaveNumber} of {MaxWaves} starting: {EnemyCount} enemies ---")
 
         # GetSimulationEntity[] returns the ROOT of the Scene Graph world.
         # It is failable (note the [] brackets), so we guard it with `if`.
@@ -186,7 +236,7 @@ wave_manager := class(creative_device):
                 # at "not cleared" forever.
                 var WatchedCount : int = 0
 
-                for (Index := 0..EnemiesPerWave - 1):
+                for (Index := 0..EnemyCount - 1):
                     # Instantiate a prefab. A prefab is a pre-assembled entity
                     # (mesh + components). `LightPost.P_LightPost{}` is used here
                     # as a visible PLACEHOLDER until we build a real enemy prefab.
@@ -244,7 +294,11 @@ wave_manager := class(creative_device):
                         # We hand it AttachedHealthComp (the one read back off the
                         # entity), not NewHealthComp, so we only ever watch a
                         # component that is genuinely attached.
-                        spawn { WatchEnemyDeath(AttachedHealthComp) }
+                        #
+                        # ThisGeneration is captured now and travels with the
+                        # task, so when it finally wakes it can tell whether its
+                        # wave is still the current one.
+                        spawn { WatchEnemyDeath(AttachedHealthComp, ThisGeneration) }
                         set WatchedCount += 1
                     else:
                         Print("WARNING: enemy {Index} has no health_component after AddComponents")
@@ -260,7 +314,7 @@ wave_manager := class(creative_device):
                 # because nothing has damaged anyone.
                 set LiveEnemyCount = WatchedCount
 
-                Print("Wave spawned - {LiveEnemyCount} enemies alive, in a row from the SpawnMarker")
+                Print("Wave {CurrentWaveNumber} spawned - {LiveEnemyCount} enemies alive")
             else:
                 Print("WARNING: SpawnMarker is not assigned - place a prop in the level and assign it in the wave_manager Details panel")
         else:
@@ -297,7 +351,7 @@ wave_manager := class(creative_device):
     # not Cancel. So if a wave is wiped by ClearCurrentWave instead of being
     # killed, these tasks park forever. Accepted for now; the fix is to race
     # this against a wave-ended event, which is a separate step.
-    WatchEnemyDeath(HealthComp : health_component)<suspends> : void =
+    WatchEnemyDeath(HealthComp : health_component, Generation : int)<suspends> : void =
         # Await returns the payload of EliminatedEvent, which is the entity that
         # died - so we do not need to capture the entity separately.
         DeadEntity : entity = HealthComp.EliminatedEvent.Await()
@@ -307,7 +361,7 @@ wave_manager := class(creative_device):
         # behaviour for free.
         DeadEntity.RemoveFromParent()
 
-        OnEnemyDied()
+        OnEnemyDied(Generation)
 
     # Single place where the live count goes down, and the only place that
     # decides a wave is cleared.
@@ -320,11 +374,42 @@ wave_manager := class(creative_device):
     # What actually guarantees the count is trustworthy is health_component's
     # own `if (CurrentHealth > 0.0)` guard in ApplyDamage: it makes each enemy
     # fire EliminatedEvent at most once per life, so nobody is counted twice.
-    OnEnemyDied() : void =
-        set LiveEnemyCount -= 1
-        Print("Enemy eliminated - {LiveEnemyCount} enemies left alive")
+    OnEnemyDied(Generation : int) : void =
+        # Stale-watcher guard. A watcher left over from an abandoned wave cannot
+        # actually fire (its entity is out of the scene, so nothing damages it
+        # and nothing signals its event), but comparing stamps turns that from
+        # "should not happen" into "cannot happen": an old stamp means an old
+        # wave, and old waves may not touch the current counter.
+        if (Generation = WaveGeneration):
+            set LiveEnemyCount -= 1
+            Print("Enemy eliminated - {LiveEnemyCount} enemies left alive")
 
-        # `<= 0` rather than `= 0` so an unexpected extra death can never step
-        # over the condition and leave the wave permanently uncleared.
-        if (LiveEnemyCount <= 0):
-            Print("Wave cleared!")
+            # `<= 0` rather than `= 0` so an unexpected extra death can never
+            # step over the condition and leave the wave permanently uncleared.
+            if (LiveEnemyCount <= 0):
+                Print("Wave {CurrentWaveNumber} cleared!")
+
+                # The cap lives HERE, on the chaining decision, not in
+                # StartWave. StartWave stays unconditional, which is what keeps
+                # the Start button able to restart from wave 1 at any time,
+                # including after a win.
+                if (CurrentWaveNumber >= MaxWaves):
+                    Print("All {MaxWaves} waves survived - you win!")
+                else:
+                    # Hand the wait to a separate task so THIS function stays
+                    # non-suspending. Sleeping inline would put a suspension
+                    # point between the decrement and the check above and
+                    # destroy the atomicity the whole design relies on.
+                    spawn { ChainNextWave(Generation) }
+
+    # Waits out the gap between waves, then starts the next one.
+    ChainNextWave(FromGeneration : int)<suspends> : void =
+        Sleep(TimeBetweenWaves)
+
+        # Re-check the stamp AFTER sleeping. During those seconds the player may
+        # have pressed Start, which bumps WaveGeneration; chaining anyway would
+        # wipe the wave they just asked for and skip ahead a number.
+        if (FromGeneration = WaveGeneration):
+            StartWave(CurrentWaveNumber + 1)
+        else:
+            Print("Wave chain cancelled - a new wave was started during the break")
