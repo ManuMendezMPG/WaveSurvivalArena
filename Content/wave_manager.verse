@@ -68,10 +68,22 @@ wave_manager := class(creative_device):
     @editable
     DamagePerHit : float = 34.0
 
-    # Every entity spawned so far. `var` makes the field mutable; `[]entity` is
-    # the Scene Graph entity array type (same one AddEntities takes).
-    # Phase 2 only fills it - the live-enemy count will read it later.
+    # EVERYTHING spawned in the current wave, alive or dead. This is NOT the
+    # live-enemy list: dead enemies stay in here until the whole wave is
+    # cleared. Its only job is to give ClearCurrentWave something to sweep, and
+    # to give the damage pass something to iterate.
+    #
+    # Re-damaging a dead enemy through this list is harmless: health_component's
+    # ApplyDamage ignores damage once CurrentHealth is 0, so it never fires
+    # EliminatedEvent twice. That guard is what lets us skip all list surgery.
     var SpawnedEnemies : []entity = array{}
+
+    # How many enemies of the current wave are still alive. THE authority on
+    # "is the wave cleared" - deliberately not derived from SpawnedEnemies,
+    # which can be mid-update when a death is processed (see OnEnemyDied).
+    # Only OnEnemyDied decrements it; only the spawn loop and ClearCurrentWave
+    # assign it.
+    var LiveEnemyCount : int = 0
 
     # OnBegin runs ONCE when the game starts. `<override>` says we are
     # replacing the empty base version defined in creative_device.
@@ -108,6 +120,16 @@ wave_manager := class(creative_device):
         # Drop every reference. `array{}` is an empty array literal; its type is
         # inferred from the field, which is already declared as []entity.
         set SpawnedEnemies = array{}
+
+        # Reset the live count too. The spawn loop overwrites this a moment
+        # later, but not if it bails out on a failed guard - and a stale count
+        # would leave the wave permanently "not cleared".
+        #
+        # NOTE: enemies wiped this way are removed WITHOUT dying, so their
+        # WatchEnemyDeath tasks stay parked on Await() forever. Accepted for
+        # now: `task` has no Cancel in this SDK, and the fix (race against a
+        # wave-ended event) is a separate step.
+        set LiveEnemyCount = 0
 
         Print("Cleared previous wave - {RemovedCount} enemies removed")
 
@@ -157,6 +179,13 @@ wave_manager := class(creative_device):
                 # float, and Verse has no implicit int-to-float conversion.
                 var CurrentOffset : float = 0.0
 
+                # Counts enemies that are actually WATCHABLE (component attached
+                # and readable back). LiveEnemyCount is seeded from this, not
+                # from EnemiesPerWave: an enemy nobody is watching can never
+                # report its death, so counting it would leave the wave stuck
+                # at "not cleared" forever.
+                var WatchedCount : int = 0
+
                 for (Index := 0..EnemiesPerWave - 1):
                     # Instantiate a prefab. A prefab is a pre-assembled entity
                     # (mesh + components). `LightPost.P_LightPost{}` is used here
@@ -201,65 +230,101 @@ wave_manager := class(creative_device):
                         AttachedHealthComp := Enemy.GetComponent[health_component]
                     then:
                         Print("Enemy {Index} has a health_component with {AttachedHealthComp.MaxHealth} max health")
+
+                        # Start listening for THIS enemy's death. One task per
+                        # enemy is the only shape that works: Await() blocks on a
+                        # single event, and sync{} needs a branch count fixed at
+                        # compile time, so neither can cover a dynamic N.
+                        #
+                        # `spawn` launches the task without suspending us - the
+                        # task runs until its Await() and parks there. Calling it
+                        # from a non-suspends handler is fine; see
+                        # EntityEnteredExampleComponent.verse:29 for the same shape.
+                        #
+                        # We hand it AttachedHealthComp (the one read back off the
+                        # entity), not NewHealthComp, so we only ever watch a
+                        # component that is genuinely attached.
+                        spawn { WatchEnemyDeath(AttachedHealthComp) }
+                        set WatchedCount += 1
                     else:
                         Print("WARNING: enemy {Index} has no health_component after AddComponents")
 
-                    # Track it for the future live-enemy count.
+                    # Track it so ClearCurrentWave can sweep it later. Note this
+                    # keeps growing with dead enemies too - see the field comment.
                     set SpawnedEnemies += array{ Enemy }
 
                     set CurrentOffset += EnemySpacing
 
-                # Now that each wave clears the previous one, SpawnedEnemies.Length
-                # is the live enemy count, not a running total.
-                Print("Wave spawned - {SpawnedEnemies.Length} enemies now alive, in a row from the SpawnMarker")
+                # Seed the live count from the enemies we are actually watching.
+                # Assigned once, after the loop: no death can have happened yet,
+                # because nothing has damaged anyone.
+                set LiveEnemyCount = WatchedCount
+
+                Print("Wave spawned - {LiveEnemyCount} enemies alive, in a row from the SpawnMarker")
             else:
                 Print("WARNING: SpawnMarker is not assigned - place a prop in the level and assign it in the wave_manager Details panel")
         else:
             Print("WARNING: no simulation entity available - cannot spawn")
 
-    # Damages every living enemy of the current wave by DamagePerHit, and drops
-    # the ones that die out of the world and out of the tracking list.
+    # Applies one hit of damage to the whole wave.
     #
-    # Deliberately does NOT use health_component.EliminatedEvent: reading
-    # CurrentHealth straight after the hit keeps this step synchronous and
-    # self-contained. The event stays in the component, untouched, for the wave
-    # counting step later on.
+    # This handler no longer decides who died. It only deals damage; death is
+    # detected by WatchEnemyDeath through EliminatedEvent. That split is the
+    # whole point: when damage starts coming from weapons or traps there will be
+    # no central place to check health, so death handling must live with the
+    # component, not with whatever caused the hit.
     #
-    # ITERATION SAFETY: SpawnedEnemies is never edited while it is being looped
-    # over. We collect the keepers into a fresh `Survivors` array and assign it
-    # once, at the end. Verse arrays are values, so mutating the field mid-loop
-    # would quietly operate on a stale snapshot instead of failing loudly.
+    # It walks the full SpawnedEnemies list, dead ones included. Harmless:
+    # ApplyDamage returns early once CurrentHealth is 0, so a corpse absorbs
+    # nothing and re-fires nothing.
     OnDamagePressed(InAgent : agent) : void =
-        Print("Damage button pressed - applying {DamagePerHit} damage to {SpawnedEnemies.Length} tracked enemies")
-
-        var Survivors : []entity = array{}
-        var DamagedCount : int = 0
-        var KilledCount : int = 0
+        Print("Damage button pressed - {DamagePerHit} damage to the wave ({LiveEnemyCount} alive, {SpawnedEnemies.Length} tracked)")
 
         for (Enemy : SpawnedEnemies):
             if:
                 HealthComp := Enemy.GetComponent[health_component]
             then:
                 HealthComp.ApplyDamage(DamagePerHit)
-                set DamagedCount += 1
-
-                if (HealthComp.CurrentHealth > 0.0):
-                    set Survivors += array{ Enemy }
-                else:
-                    # Dead. RemoveFromParent takes it out of the scene, and
-                    # leaving it out of Survivors is what removes it from
-                    # SpawnedEnemies - so it can never be hit again.
-                    Enemy.RemoveFromParent()
-                    set KilledCount += 1
             else:
-                # No health_component, so nothing can damage it. Keep tracking it
-                # anyway: dropping it here would leave the entity in the world
-                # with nothing referencing it, and ClearCurrentWave would never
-                # be able to clean it up.
-                Print("WARNING: a tracked enemy has no health_component - left untouched")
-                set Survivors += array{ Enemy }
+                Print("WARNING: a tracked enemy has no health_component - cannot damage it")
 
-        # Single point of mutation for the whole pass.
-        set SpawnedEnemies = Survivors
+        Print("Damage pass done - {LiveEnemyCount} still alive")
 
-        Print("Damage applied to {DamagedCount} enemies - {KilledCount} eliminated, {SpawnedEnemies.Length} still alive")
+    # One instance of this task runs per living enemy, parked on Await() until
+    # that specific enemy dies. Launched by the spawn loop via `spawn`.
+    #
+    # No cancellation: `task` in /Verse.org/Concurrency exposes only Await(),
+    # not Cancel. So if a wave is wiped by ClearCurrentWave instead of being
+    # killed, these tasks park forever. Accepted for now; the fix is to race
+    # this against a wave-ended event, which is a separate step.
+    WatchEnemyDeath(HealthComp : health_component)<suspends> : void =
+        # Await returns the payload of EliminatedEvent, which is the entity that
+        # died - so we do not need to capture the entity separately.
+        DeadEntity : entity = HealthComp.EliminatedEvent.Await()
+
+        # Removing from the world now happens HERE, at the moment of death,
+        # rather than in the damage handler. Any future damage source gets this
+        # behaviour for free.
+        DeadEntity.RemoveFromParent()
+
+        OnEnemyDied()
+
+    # Single place where the live count goes down, and the only place that
+    # decides a wave is cleared.
+    #
+    # No data race is possible: Verse is cooperatively scheduled, so a task runs
+    # from resume to its next suspension point without interruption. There is no
+    # Await or Sleep between the decrement and the check, so the two are atomic
+    # and two near-simultaneous deaths are processed one after the other.
+    #
+    # What actually guarantees the count is trustworthy is health_component's
+    # own `if (CurrentHealth > 0.0)` guard in ApplyDamage: it makes each enemy
+    # fire EliminatedEvent at most once per life, so nobody is counted twice.
+    OnEnemyDied() : void =
+        set LiveEnemyCount -= 1
+        Print("Enemy eliminated - {LiveEnemyCount} enemies left alive")
+
+        # `<= 0` rather than `= 0` so an unexpected extra death can never step
+        # over the condition and leave the wave permanently uncleared.
+        if (LiveEnemyCount <= 0):
+            Print("Wave cleared!")
