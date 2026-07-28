@@ -36,6 +36,10 @@ wave_manager := class(creative_device):
     @editable
     StartButton : button_device = button_device{}
 
+    # Second button: every press damages the whole current wave at once.
+    @editable
+    DamageButton : button_device = button_device{}
+
     # WHERE enemies spawn. Instead of hardcoding coordinates, drop any prop in
     # the level at the desired spot and assign it here in the Details panel:
     # the spawn point then becomes something you move visually in the editor.
@@ -59,6 +63,11 @@ wave_manager := class(creative_device):
     @editable
     EnemySpacing : float = 200.0
 
+    # Damage dealt to EVERY living enemy per DamageButton press. With the
+    # health_component default of 100 max health, 34.0 means three presses kill.
+    @editable
+    DamagePerHit : float = 34.0
+
     # Every entity spawned so far. `var` makes the field mutable; `[]entity` is
     # the Scene Graph entity array type (same one AddEntities takes).
     # Phase 2 only fills it - the live-enemy count will read it later.
@@ -75,6 +84,7 @@ wave_manager := class(creative_device):
         # time a player interacts with StartButton, InteractedWithEvent
         # fires and calls OnStartPressed, passing along the interacting agent.
         StartButton.InteractedWithEvent.Subscribe(OnStartPressed)
+        DamageButton.InteractedWithEvent.Subscribe(OnDamagePressed)
 
     # Removes the enemies of the previous wave from the world and forgets them.
     #
@@ -206,3 +216,50 @@ wave_manager := class(creative_device):
                 Print("WARNING: SpawnMarker is not assigned - place a prop in the level and assign it in the wave_manager Details panel")
         else:
             Print("WARNING: no simulation entity available - cannot spawn")
+
+    # Damages every living enemy of the current wave by DamagePerHit, and drops
+    # the ones that die out of the world and out of the tracking list.
+    #
+    # Deliberately does NOT use health_component.EliminatedEvent: reading
+    # CurrentHealth straight after the hit keeps this step synchronous and
+    # self-contained. The event stays in the component, untouched, for the wave
+    # counting step later on.
+    #
+    # ITERATION SAFETY: SpawnedEnemies is never edited while it is being looped
+    # over. We collect the keepers into a fresh `Survivors` array and assign it
+    # once, at the end. Verse arrays are values, so mutating the field mid-loop
+    # would quietly operate on a stale snapshot instead of failing loudly.
+    OnDamagePressed(InAgent : agent) : void =
+        Print("Damage button pressed - applying {DamagePerHit} damage to {SpawnedEnemies.Length} tracked enemies")
+
+        var Survivors : []entity = array{}
+        var DamagedCount : int = 0
+        var KilledCount : int = 0
+
+        for (Enemy : SpawnedEnemies):
+            if:
+                HealthComp := Enemy.GetComponent[health_component]
+            then:
+                HealthComp.ApplyDamage(DamagePerHit)
+                set DamagedCount += 1
+
+                if (HealthComp.CurrentHealth > 0.0):
+                    set Survivors += array{ Enemy }
+                else:
+                    # Dead. RemoveFromParent takes it out of the scene, and
+                    # leaving it out of Survivors is what removes it from
+                    # SpawnedEnemies - so it can never be hit again.
+                    Enemy.RemoveFromParent()
+                    set KilledCount += 1
+            else:
+                # No health_component, so nothing can damage it. Keep tracking it
+                # anyway: dropping it here would leave the entity in the world
+                # with nothing referencing it, and ClearCurrentWave would never
+                # be able to clean it up.
+                Print("WARNING: a tracked enemy has no health_component - left untouched")
+                set Survivors += array{ Enemy }
+
+        # Single point of mutation for the whole pass.
+        set SpawnedEnemies = Survivors
+
+        Print("Damage applied to {DamagedCount} enemies - {KilledCount} eliminated, {SpawnedEnemies.Length} still alive")
