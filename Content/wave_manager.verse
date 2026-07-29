@@ -16,7 +16,8 @@ using { /Verse.org/SceneGraph }                     # entity, GetSimulationEntit
 #   Thing.GetTransform()       -> classic transform (X/Y/Z)   <- do NOT use here
 #   Thing.GetGlobalTransform() -> Scene Graph transform (LUF)  <- use this one
 # Picking the right getter is what keeps the two worlds from mixing.
-using { /Verse.org/SpatialMath }                    # transform, vector3 (LUF), DistanceForwardLeft
+using { /Verse.org/SceneGraph/KeyframedMovement }   # keyframed_movement_component, deltas, easing
+using { /Verse.org/SpatialMath }                    # transform, vector3 (LUF), Distance, DistanceForwardLeft
 using { /Verse.org/Random }                         # GetRandomFloat
 using { /Verse.org/Verse }                          # Min, Max
 using { /UnrealEngine.com/Temporary/Diagnostics }   # Print
@@ -121,6 +122,15 @@ wave_manager := class(creative_device):
     # is too close. A cap, not a target - see PickSpawnPosition.
     @editable
     MaxPlacementAttempts : int = 10
+
+    # How fast enemies walk to the pasture, in centimeters per second. Travel
+    # time is derived from this and the distance, so enemies starting further
+    # away take proportionally longer instead of all arriving together.
+    #
+    # 0 or less means "do not move" and is handled explicitly - see
+    # MoveEnemyToPasture. Never used as a divisor without that check.
+    @editable
+    EnemySpeed : float = 100.0
 
     # Uniform size multiplier for spawned enemies: 1.0 is the prefab's authored
     # size, 2.0 is double. Applied to all three axes, so cows keep their
@@ -294,6 +304,68 @@ wave_manager := class(creative_device):
 
         ChosenPosition
 
+    # Starts one enemy walking from `CurrentPosition` to `Target`.
+    #
+    # Uses keyframed movement, following the pattern proven in
+    # FindOverlapHitsExampleComponent.verse:105-117. SetKeyframes rebases the
+    # path on the entity's CURRENT transform, which is why callers must place
+    # the enemy with SetGlobalTransform BEFORE calling this.
+    #
+    # Fully synchronous: SetKeyframes and Play both return void and neither
+    # suspends, so the engine does the animating and no task is spawned. That is
+    # what keeps StartWave atomic and leaves the generation stamping untouched -
+    # there is no movement task that could go stale.
+    MoveEnemyToPasture(Enemy : entity, CurrentPosition : vector3, Target : vector3) : void =
+        # Speed guards the division below. Zero or negative means "stay put",
+        # which is a legitimate setting, so we skip rather than substitute some
+        # made-up duration the designer never asked for.
+        if (EnemySpeed > 0.0):
+            # Make sure the entity has a movement component, whether or not the
+            # prefab shipped with one. Both branches log, so the first run tells
+            # us which case P_Cow actually is.
+            if:
+                ExistingMovementComp := Enemy.GetComponent[keyframed_movement_component]
+            then:
+                Print("Enemy already had a keyframed_movement_component")
+            else:
+                Print("Enemy had no keyframed_movement_component - adding one")
+                Enemy.AddComponents(array{ keyframed_movement_component{ Entity := Enemy } })
+
+            # Fetch it again: present now by either route, so the driving code
+            # below exists once instead of being duplicated in both branches.
+            if:
+                MovementComp := Enemy.GetComponent[keyframed_movement_component]
+            then:
+                TravelDistance : float = Distance(CurrentPosition, Target)
+                TravelDuration : float = TravelDistance / EnemySpeed
+
+                # Keyframes are RELATIVE, so the translation is the difference
+                # between here and there.
+                #
+                # Scale MUST be all zeros. The digest states translation and
+                # scale are applied ADDITIVELY, so leaving Scale at its default
+                # would add to the enemy's size every step of the journey and
+                # the cow would swell as it walked.
+                DeltaTransform : transform = transform:
+                    Translation := Target - CurrentPosition
+                    Scale := vector3{ Left := 0.0, Up := 0.0, Forward := 0.0 }
+
+                # Linear easing, not the ease-in the abduction sample uses: a
+                # walking animal should hold a constant speed, not accelerate.
+                Keyframe : keyframed_movement_delta = keyframed_movement_delta:
+                    Transform := DeltaTransform
+                    Duration := TravelDuration
+                    Easing := linear_easing_function{}
+
+                MovementComp.SetKeyframes(array{ Keyframe }, oneshot_keyframed_movement_playback_mode{})
+                MovementComp.Play()
+
+                Print("Enemy walking to pasture - {TravelDistance} cm over {TravelDuration} s")
+            else:
+                Print("WARNING: could not get a keyframed_movement_component - enemy will not move")
+        else:
+            Print("WARNING: EnemySpeed must be greater than 0 - enemy will not move")
+
     # Spawns wave `WaveNumber`. THE single spawn path: both the button and the
     # automatic chaining go through here, so the spawn logic exists once.
     #
@@ -324,19 +396,34 @@ wave_manager := class(creative_device):
 
         Print("--- Wave {WaveNumber} of {MaxWaves} starting: {EnemyCount} enemies ---")
 
-        # Resolve and report the pasture area. Nothing uses it yet; this is here
-        # so the corner placement can be verified in the log before any movement
-        # code depends on it.
+        # Resolve the pasture area and work out where enemies walk to.
         #
         # Deliberately OUTSIDE the spawn guards below and with its own
         # independent check: a missing pasture must never stop enemies from
-        # spawning. It is a warning, not a blocker.
+        # spawning. It is a warning, not a blocker - without it they simply
+        # stand still.
+        #
+        # These two are `var`s declared out here rather than bindings inside the
+        # `if` below, because a binding is only visible within its own block and
+        # the spawn loop sits several levels deeper.
+        var PastureCentre : vector3 = vector3{ Left := 0.0, Up := 0.0, Forward := 0.0 }
+        var HasPasture : logic = false
+
         if:
             PastureCornerA.IsValid[]
             PastureCornerB.IsValid[]
         then:
             PastureZone : spawn_zone = MakeZoneFromCorners(PastureCornerA, PastureCornerB)
             Print("Pasture zone - Left {PastureZone.MinLeft} to {PastureZone.MaxLeft}, Forward {PastureZone.MinForward} to {PastureZone.MaxForward}, Up {PastureZone.Up}")
+
+            # STEP 2 uses the centre of the zone for everyone. Step 3 will hand
+            # each enemy its own random point via PickSpawnPosition instead, so
+            # the herd arrives spread out rather than stacked on one spot.
+            set PastureCentre = vector3:
+                Left := (PastureZone.MinLeft + PastureZone.MaxLeft) / 2.0
+                Up := PastureZone.Up
+                Forward := (PastureZone.MinForward + PastureZone.MaxForward) / 2.0
+            set HasPasture = true
         else:
             Print("WARNING: pasture area not defined - assign BOTH PastureCornerA and PastureCornerB in the wave_manager Details panel")
 
@@ -450,6 +537,20 @@ wave_manager := class(creative_device):
                         set WatchedCount += 1
                     else:
                         Print("WARNING: enemy {Index} has no health_component after AddComponents")
+
+                    # STEP 2 SCOPE: only enemy 0 walks, and only if the pasture
+                    # is defined. Deliberately one enemy: it makes the behaviour
+                    # obvious on screen and separates "does it compile" from
+                    # "does it do what I expect". Step 3 drops the index test and
+                    # gives every enemy its own destination.
+                    #
+                    # Placed here, after SetGlobalTransform, because SetKeyframes
+                    # rebases the path on the entity's current transform.
+                    if:
+                        Index = 0
+                        HasPasture?
+                    then:
+                        MoveEnemyToPasture(Enemy, SpawnTranslation, PastureCentre)
 
                     # Track it so ClearCurrentWave can sweep it later. Note this
                     # keeps growing with dead enemies too - see the field comment.
