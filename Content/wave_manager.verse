@@ -238,9 +238,12 @@ wave_manager := class(creative_device):
 
                 for (Index := 0..EnemyCount - 1):
                     # Instantiate a prefab. A prefab is a pre-assembled entity
-                    # (mesh + components). `LightPost.P_LightPost{}` is used here
-                    # as a visible PLACEHOLDER until we build a real enemy prefab.
-                    Enemy : entity = LightPost.P_LightPost{}
+                    # (mesh + components). `Prefabs.P_Cow{}` is still a
+                    # PLACEHOLDER until we build a real enemy prefab, but it
+                    # reads as a target far better than the light post did.
+                    # Swapping it is a one-identifier change because P_Cow is
+                    # declared `class<final>(entity)` exactly like P_LightPost.
+                    Enemy : entity = Prefabs.P_Cow{}
 
                     # AddEntities inserts the new entity into the live world.
                     # Until this call, the prefab exists but is not "in the scene".
