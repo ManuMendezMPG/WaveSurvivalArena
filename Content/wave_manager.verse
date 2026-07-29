@@ -111,6 +111,12 @@ wave_manager := class(creative_device):
     @editable
     MaxPlacementAttempts : int = 10
 
+    # Uniform size multiplier for spawned enemies: 1.0 is the prefab's authored
+    # size, 2.0 is double. Applied to all three axes, so cows keep their
+    # proportions and only get bigger or smaller.
+    @editable
+    EnemyScale : float = 2.0
+
     # Damage dealt to EVERY living enemy per DamageButton press. With the
     # health_component default of 100 max health, 34.0 means three presses kill.
     @editable
@@ -354,11 +360,16 @@ wave_manager := class(creative_device):
                     # enemies already placed this wave.
                     #
                     # We rebuild the transform from scratch around that
-                    # translation, so each enemy ignores whatever rotation/scale
-                    # the corner props happen to have and keeps identity
-                    # rotation + scale 1 (upright, full size).
+                    # translation, so each enemy ignores whatever rotation the
+                    # corner props happen to have and stands upright.
+                    #
+                    # Scale is now set explicitly instead of being left at its
+                    # default. transform.Scale is a vector3, so a uniform size
+                    # means repeating EnemyScale on all three LUF axes. Rotation
+                    # is still left alone.
                     SpawnTranslation : vector3 = PickSpawnPosition(Zone, PlacedPositions)
-                    SpawnTransform : transform = transform{ Translation := SpawnTranslation }
+                    SpawnScale : vector3 = vector3{ Left := EnemyScale, Up := EnemyScale, Forward := EnemyScale }
+                    SpawnTransform : transform = transform{ Translation := SpawnTranslation, Scale := SpawnScale }
                     Enemy.SetGlobalTransform(SpawnTransform)
 
                     # Remember it so the next enemy of this wave avoids it.
