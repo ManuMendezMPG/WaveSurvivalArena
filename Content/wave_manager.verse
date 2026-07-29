@@ -85,6 +85,17 @@ wave_manager := class(creative_device):
     @editable
     SpawnAreaCornerB : creative_prop = creative_prop{}
 
+    # The PASTURE area, defined exactly like the spawn area above: two props at
+    # opposite corners, fed through the same MakeZoneFromCorners. This is the
+    # reuse the spawn_zone struct was designed for.
+    #
+    # Nothing moves towards it yet - this step only defines and logs the zone.
+    @editable
+    PastureCornerA : creative_prop = creative_prop{}
+
+    @editable
+    PastureCornerB : creative_prop = creative_prop{}
+
     # Size of wave 1. Later waves derive their size from this - see StartWave.
     @editable
     EnemiesPerWave : int = 5
@@ -312,6 +323,22 @@ wave_manager := class(creative_device):
         EnemyCount : int = EnemiesPerWave + (WaveNumber - 1) * EnemiesIncrementPerWave
 
         Print("--- Wave {WaveNumber} of {MaxWaves} starting: {EnemyCount} enemies ---")
+
+        # Resolve and report the pasture area. Nothing uses it yet; this is here
+        # so the corner placement can be verified in the log before any movement
+        # code depends on it.
+        #
+        # Deliberately OUTSIDE the spawn guards below and with its own
+        # independent check: a missing pasture must never stop enemies from
+        # spawning. It is a warning, not a blocker.
+        if:
+            PastureCornerA.IsValid[]
+            PastureCornerB.IsValid[]
+        then:
+            PastureZone : spawn_zone = MakeZoneFromCorners(PastureCornerA, PastureCornerB)
+            Print("Pasture zone - Left {PastureZone.MinLeft} to {PastureZone.MaxLeft}, Forward {PastureZone.MinForward} to {PastureZone.MaxForward}, Up {PastureZone.Up}")
+        else:
+            Print("WARNING: pasture area not defined - assign BOTH PastureCornerA and PastureCornerB in the wave_manager Details panel")
 
         # GetSimulationEntity[] returns the ROOT of the Scene Graph world.
         # It is failable (note the [] brackets), so we guard it with `if`.
