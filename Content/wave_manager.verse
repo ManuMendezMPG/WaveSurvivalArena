@@ -132,6 +132,17 @@ wave_manager := class(creative_device):
     @editable
     EnemySpeed : float = 100.0
 
+    # Correction added to the computed facing angle, in degrees.
+    #
+    # Two things this code cannot know decide whether enemies end up facing the
+    # right way: which local axis the P_Cow model was authored looking down, and
+    # the exact sign convention of the LUF yaw. Both fail the same way - every
+    # enemy turned by the same fixed amount - and both are fixed by the same
+    # constant. So it is a dial you turn in the editor (try 90, -90 or 180)
+    # instead of a guess baked into the code.
+    @editable
+    EnemyFacingOffsetDegrees : float = 0.0
+
     # Uniform size multiplier for spawned enemies: 1.0 is the prefab's authored
     # size, 2.0 is double. Applied to all three axes, so cows keep their
     # proportions and only get bigger or smaller.
@@ -303,6 +314,32 @@ wave_manager := class(creative_device):
                     set Accepted = true
 
         ChosenPosition
+
+    # Returns the rotation that turns an enemy at `From` to face `To`.
+    #
+    # There is no look-at helper in the SDK - no LookAt, no RotationFromTo, no
+    # direction-to-rotation function anywhere in the digest - so the angle is
+    # computed by hand.
+    MakeFacingRotation(From : vector3, To : vector3) : rotation =
+        Direction : vector3 = To - From
+
+        # ArcTan(Y, X) is atan2: the angle from the +X axis round to the ray
+        # (X, Y). Mapping that onto LUF, Forward plays X (the reference axis a
+        # zero angle points down) and Left plays Y (the axis a positive angle
+        # turns towards). Sanity check: a pure +Forward direction gives
+        # ArcTan(0, positive) = 0, i.e. no rotation, which is exactly right.
+        #
+        # The digest guarantees it returns 0.0 when both arguments are 0, so an
+        # enemy that somehow spawns on top of its destination is safe.
+        Yaw : float = ArcTan(Direction.Left, Direction.Forward)
+
+        OffsetRadians : float = EnemyFacingOffsetDegrees * PiFloat / 180.0
+
+        # Euler over LUF, turning ONLY the Up axis: enemies swivel on the spot
+        # and stay upright. MakeRotationFromEulerRadians is used rather than the
+        # YawPitchRoll variant because the latter documents its yaw as a rotation
+        # about the DOWN axis - an inverted sign waiting to happen.
+        MakeRotationFromEulerRadians(0.0, Yaw + OffsetRadians, 0.0)
 
     # Starts one enemy walking from `CurrentPosition` to `Target`.
     #
@@ -550,6 +587,31 @@ wave_manager := class(creative_device):
                     # rebases the path on the entity's current transform.
                     if (HasPasture?):
                         PastureTarget : vector3 = PickSpawnPosition(PastureZone, PastureTargets)
+
+                        # Turn it to face where it is about to walk.
+                        #
+                        # This re-writes the transform set a few lines above,
+                        # now including the facing. Doing it here rather than
+                        # reordering the loop keeps the change confined to this
+                        # block, and the no-pasture case above keeps its original
+                        # behaviour untouched.
+                        #
+                        # Because movement is a straight line, the facing worked
+                        # out now stays correct for the whole journey - nothing
+                        # needs re-orienting in flight, and the keyframe carries
+                        # no rotation of its own.
+                        #
+                        # All three fields are written explicitly so neither the
+                        # position nor EnemyScale is lost in this second write.
+                        # It must also happen BEFORE MoveEnemyToPasture, since
+                        # SetKeyframes rebases its path on the current transform.
+                        FacingRotation : rotation = MakeFacingRotation(SpawnTranslation, PastureTarget)
+                        FacingTransform : transform = transform:
+                            Translation := SpawnTranslation
+                            Rotation := FacingRotation
+                            Scale := SpawnScale
+                        Enemy.SetGlobalTransform(FacingTransform)
+
                         MoveEnemyToPasture(Enemy, SpawnTranslation, PastureTarget)
 
                         # Remember it so the next enemy aims somewhere else.
