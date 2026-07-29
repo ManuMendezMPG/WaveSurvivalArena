@@ -405,24 +405,17 @@ wave_manager := class(creative_device):
         #
         # These two are `var`s declared out here rather than bindings inside the
         # `if` below, because a binding is only visible within its own block and
-        # the spawn loop sits several levels deeper.
-        var PastureCentre : vector3 = vector3{ Left := 0.0, Up := 0.0, Forward := 0.0 }
+        # the spawn loop sits several levels deeper. The dummy zone is never read
+        # unless HasPasture is true.
+        var PastureZone : spawn_zone = spawn_zone{ MinLeft := 0.0, MaxLeft := 0.0, MinForward := 0.0, MaxForward := 0.0, Up := 0.0 }
         var HasPasture : logic = false
 
         if:
             PastureCornerA.IsValid[]
             PastureCornerB.IsValid[]
         then:
-            PastureZone : spawn_zone = MakeZoneFromCorners(PastureCornerA, PastureCornerB)
+            set PastureZone = MakeZoneFromCorners(PastureCornerA, PastureCornerB)
             Print("Pasture zone - Left {PastureZone.MinLeft} to {PastureZone.MaxLeft}, Forward {PastureZone.MinForward} to {PastureZone.MaxForward}, Up {PastureZone.Up}")
-
-            # STEP 2 uses the centre of the zone for everyone. Step 3 will hand
-            # each enemy its own random point via PickSpawnPosition instead, so
-            # the herd arrives spread out rather than stacked on one spot.
-            set PastureCentre = vector3:
-                Left := (PastureZone.MinLeft + PastureZone.MaxLeft) / 2.0
-                Up := PastureZone.Up
-                Forward := (PastureZone.MinForward + PastureZone.MaxForward) / 2.0
             set HasPasture = true
         else:
             Print("WARNING: pasture area not defined - assign BOTH PastureCornerA and PastureCornerB in the wave_manager Details panel")
@@ -449,6 +442,12 @@ wave_manager := class(creative_device):
                 # Positions chosen so far THIS wave, used to keep enemies apart.
                 # Local, so it resets with every wave and adds no class state.
                 var PlacedPositions : []vector3 = array{}
+
+                # The same idea for the other end of the journey: pasture
+                # destinations handed out so far, so PickSpawnPosition spreads
+                # arrivals out instead of stacking the whole herd on one spot.
+                # Separate list because it lives in a different area entirely.
+                var PastureTargets : []vector3 = array{}
 
                 # Counts enemies that are actually WATCHABLE (component attached
                 # and readable back). LiveEnemyCount is seeded from this, not
@@ -538,19 +537,23 @@ wave_manager := class(creative_device):
                     else:
                         Print("WARNING: enemy {Index} has no health_component after AddComponents")
 
-                    # STEP 2 SCOPE: only enemy 0 walks, and only if the pasture
-                    # is defined. Deliberately one enemy: it makes the behaviour
-                    # obvious on screen and separates "does it compile" from
-                    # "does it do what I expect". Step 3 drops the index test and
-                    # gives every enemy its own destination.
+                    # Send it walking to the pasture, if one is defined.
+                    #
+                    # The destination is its OWN random point in the pasture,
+                    # from the very same PickSpawnPosition used to scatter the
+                    # spawn - just pointed at the other zone and fed a different
+                    # list of taken spots. Sending everyone to the centre would
+                    # make the whole herd converge on one point and interpenetrate
+                    # on arrival.
                     #
                     # Placed here, after SetGlobalTransform, because SetKeyframes
                     # rebases the path on the entity's current transform.
-                    if:
-                        Index = 0
-                        HasPasture?
-                    then:
-                        MoveEnemyToPasture(Enemy, SpawnTranslation, PastureCentre)
+                    if (HasPasture?):
+                        PastureTarget : vector3 = PickSpawnPosition(PastureZone, PastureTargets)
+                        MoveEnemyToPasture(Enemy, SpawnTranslation, PastureTarget)
+
+                        # Remember it so the next enemy aims somewhere else.
+                        set PastureTargets += array{ PastureTarget }
 
                     # Track it so ClearCurrentWave can sweep it later. Note this
                     # keeps growing with dead enemies too - see the field comment.
