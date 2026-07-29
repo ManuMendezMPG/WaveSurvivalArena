@@ -16,8 +16,29 @@ using { /Verse.org/SceneGraph }                     # entity, GetSimulationEntit
 #   Thing.GetTransform()       -> classic transform (X/Y/Z)   <- do NOT use here
 #   Thing.GetGlobalTransform() -> Scene Graph transform (LUF)  <- use this one
 # Picking the right getter is what keeps the two worlds from mixing.
-using { /Verse.org/SpatialMath }                    # transform, vector3 (LUF)
+using { /Verse.org/SpatialMath }                    # transform, vector3 (LUF), DistanceForwardLeft
+using { /Verse.org/Random }                         # GetRandomFloat
+using { /Verse.org/Verse }                          # Min, Max
 using { /UnrealEngine.com/Temporary/Diagnostics }   # Print
+
+# An axis-aligned rectangular area of the world, in Scene Graph LUF
+# centimeters. Held as min/max per axis rather than centre+size because that is
+# what random placement actually needs: GetRandomFloat takes a low and a high.
+#
+# `Up` is a single value, not a range: areas are flat, and everything placed in
+# one sits on that height.
+#
+# Rotation is ignored on purpose - the rectangle is always aligned to the world
+# axes. A room set at an angle will not be followed exactly.
+#
+# This type exists to be REUSED: the upcoming pasture area will be another
+# spawn_zone built the same way, with its own pair of corner props.
+spawn_zone := struct:
+    MinLeft : float
+    MaxLeft : float
+    MinForward : float
+    MaxForward : float
+    Up : float
 
 # Wave Manager: entry point for the arena's game flow.
 # Phase 1 goal: react to a button press. This is the core
@@ -40,18 +61,29 @@ wave_manager := class(creative_device):
     @editable
     DamageButton : button_device = button_device{}
 
-    # WHERE enemies spawn. Instead of hardcoding coordinates, drop any prop in
-    # the level at the desired spot and assign it here in the Details panel:
-    # the spawn point then becomes something you move visually in the editor.
+    # The spawn area, defined by two props dropped at OPPOSITE CORNERS of the
+    # rectangle. Drag them to the corners of the room you want covered and the
+    # zone is sized visually, with no numbers to guess.
+    #
+    # Which one is A and which is B does not matter: MakeZoneFromCorners takes
+    # the min and max of each axis, so any diagonal pair works.
+    #
+    # Two positions rather than one prop plus a Scale: `transform.Scale` is a
+    # multiplier, so turning it into centimeters would need the marker mesh's
+    # base size as an extra calibration value. Two corner positions are already
+    # LUF centimeters - nothing to convert, which is the whole point.
     #
     # `creative_prop` is the right pick because it:
     #   * is `concrete`, so `creative_prop{}` is a legal default value;
     #   * inherits GetGlobalTransform() -> LUF transform, exactly what Scene
     #     Graph's SetGlobalTransform expects (no type conversion needed);
-    #   * provides the failable IsValid[], which lets us detect the default
+    #   * provides the failable IsValid[], which detects the default
     #     placeholder above (i.e. "designer forgot to assign it").
     @editable
-    SpawnMarker : creative_prop = creative_prop{}
+    SpawnAreaCornerA : creative_prop = creative_prop{}
+
+    @editable
+    SpawnAreaCornerB : creative_prop = creative_prop{}
 
     # Size of wave 1. Later waves derive their size from this - see StartWave.
     @editable
@@ -69,10 +101,15 @@ wave_manager := class(creative_device):
     @editable
     TimeBetweenWaves : float = 3.0
 
-    # Distance in centimeters between two consecutive enemies in the row.
-    # Also editable so the spacing can be eyeballed in-game and adjusted.
+    # How far apart two enemies of the same wave should ideally be, in
+    # centimeters, measured on the ground plane.
     @editable
-    EnemySpacing : float = 200.0
+    MinDistanceBetweenEnemies : float = 200.0
+
+    # How many random points to try before giving up and accepting a spot that
+    # is too close. A cap, not a target - see PickSpawnPosition.
+    @editable
+    MaxPlacementAttempts : int = 10
 
     # Damage dealt to EVERY living enemy per DamageButton press. With the
     # health_component default of 100 max health, 34.0 means three presses kill.
@@ -170,6 +207,76 @@ wave_manager := class(creative_device):
         Print("Start button pressed - restarting the run at wave 1")
         StartWave(1)
 
+    # Builds a spawn_zone from two props placed at opposite corners.
+    #
+    # Min/Max per axis means the caller can assign the corners in either order:
+    # any diagonal pair describes the same rectangle.
+    #
+    # Both positions come from GetGlobalTransform() (NOT GetTransform()), so
+    # they are already /Verse.org/SpatialMath LUF centimeters. Nothing is
+    # converted anywhere in this function - that is the reason two corners beat
+    # one prop plus a Scale multiplier.
+    #
+    # `Up` is taken from corner A alone. If the two props sit at different
+    # heights, B's height is simply ignored and the area stays flat.
+    MakeZoneFromCorners(CornerA : creative_prop, CornerB : creative_prop) : spawn_zone =
+        A : vector3 = CornerA.GetGlobalTransform().Translation
+        B : vector3 = CornerB.GetGlobalTransform().Translation
+
+        spawn_zone:
+            MinLeft := Min(A.Left, B.Left)
+            MaxLeft := Max(A.Left, B.Left)
+            MinForward := Min(A.Forward, B.Forward)
+            MaxForward := Max(A.Forward, B.Forward)
+            Up := A.Up
+
+    # Returns a random point inside `Zone`, trying to stay
+    # MinDistanceBetweenEnemies away from everything in `PlacedPositions`.
+    #
+    # Method: sample a random point, measure it against the ones already placed,
+    # and resample if it is too close - up to MaxPlacementAttempts times. This
+    # is a best effort, NOT a guarantee.
+    #
+    # When the attempts run out we return the last candidate anyway rather than
+    # looping forever or refusing to place. Two enemies slightly too close is a
+    # cosmetic problem; a wave that spawns fewer enemies than asked, or a
+    # function that never returns, is not.
+    #
+    # Effects: reads editable fields and calls GetRandomFloat, which is
+    # <transacts>. Nothing here suspends, so StartWave stays atomic.
+    PickSpawnPosition(Zone : spawn_zone, PlacedPositions : []vector3) : vector3 =
+        # Seeded with a corner of the zone purely so the variable has a value;
+        # the loop below always overwrites it on its first pass.
+        var ChosenPosition : vector3 = vector3{ Left := Zone.MinLeft, Up := Zone.Up, Forward := Zone.MinForward }
+        var Accepted : logic = false
+
+        for (Attempt := 0..MaxPlacementAttempts - 1):
+            if (not Accepted?):
+                # The zone's min/max feed GetRandomFloat directly - no centre
+                # and no half-extents needed. Up is the zone's single height,
+                # never randomised, so the whole wave stays on one ground plane.
+                Candidate : vector3 = vector3:
+                    Left := GetRandomFloat(Zone.MinLeft, Zone.MaxLeft)
+                    Up := Zone.Up
+                    Forward := GetRandomFloat(Zone.MinForward, Zone.MaxForward)
+
+                # Count how many already-placed enemies this candidate crowds.
+                # DistanceForwardLeft is the 2-D distance, ignoring Up - the
+                # right measure for spacing things out on the ground.
+                var TooCloseCount : int = 0
+                for (Placed : PlacedPositions):
+                    if (DistanceForwardLeft(Candidate, Placed) < MinDistanceBetweenEnemies):
+                        set TooCloseCount += 1
+
+                # Keep the newest candidate regardless, so that if every attempt
+                # fails we still hand back a real point inside the area.
+                set ChosenPosition = Candidate
+
+                if (TooCloseCount = 0):
+                    set Accepted = true
+
+        ChosenPosition
+
     # Spawns wave `WaveNumber`. THE single spawn path: both the button and the
     # automatic chaining go through here, so the spawn logic exists once.
     #
@@ -178,6 +285,8 @@ wave_manager := class(creative_device):
     # single thread. So it runs start to finish without any watcher, damage
     # press or chain task interleaving. That is what makes the sequence
     # clear -> restamp -> spawn -> set count safe without any locking.
+    # GetRandomFloat is <transacts>, not <suspends>, so the random placement
+    # does not break this.
     StartWave(WaveNumber : int) : void =
         # 1. Sweep the previous wave out of the world first, so nothing old is
         #    left behind and LiveEnemyCount starts from a known 0.
@@ -204,30 +313,22 @@ wave_manager := class(creative_device):
         if:
             SimulationEntity := GetSimulationEntity[]
         then:
-            # IsValid[] is failable. It fails when SpawnMarker is still the
-            # default `creative_prop{}` placeholder, i.e. nothing was assigned
-            # in the Details panel. Guarding here means a forgotten assignment
-            # just logs a warning instead of spawning somewhere meaningless.
+            # IsValid[] is failable. It fails when a corner is still the default
+            # `creative_prop{}` placeholder, i.e. nothing was assigned in the
+            # Details panel. BOTH corners are required - one alone cannot
+            # describe a rectangle. Listing the two tests in the same `if` block
+            # means the guard only passes when both succeed.
             if:
-                SpawnMarker.IsValid[]
+                SpawnAreaCornerA.IsValid[]
+                SpawnAreaCornerB.IsValid[]
             then:
-                # Read the marker's position ONCE, outside the loop: it is the
-                # anchor every enemy is placed relative to.
-                # GetGlobalTransform() (NOT GetTransform()) returns a
-                # /Verse.org/SpatialMath transform, so its Translation is
-                # already a LUF vector3 and needs no conversion.
-                MarkerTranslation : vector3 = SpawnMarker.GetGlobalTransform().Translation
+                # Build the zone ONCE, outside the loop: the corners do not move
+                # while a wave is spawning.
+                Zone : spawn_zone = MakeZoneFromCorners(SpawnAreaCornerA, SpawnAreaCornerB)
 
-                # Placement pattern: a straight row along the LEFT axis.
-                # Enemy 0 lands exactly on the marker, and each following one is
-                # EnemySpacing centimeters further along Left. Up and Forward are
-                # copied from the marker untouched, so the whole row shares its
-                # height and depth and nobody floats or sinks.
-                #
-                # The offset is accumulated instead of computed as
-                # `Index * EnemySpacing`: Index is an int and EnemySpacing a
-                # float, and Verse has no implicit int-to-float conversion.
-                var CurrentOffset : float = 0.0
+                # Positions chosen so far THIS wave, used to keep enemies apart.
+                # Local, so it resets with every wave and adds no class state.
+                var PlacedPositions : []vector3 = array{}
 
                 # Counts enemies that are actually WATCHABLE (component attached
                 # and readable back). LiveEnemyCount is seeded from this, not
@@ -249,13 +350,19 @@ wave_manager := class(creative_device):
                     # Until this call, the prefab exists but is not "in the scene".
                     SimulationEntity.AddEntities(array{ Enemy })
 
-                    # We build the translation field by field and rebuild the
-                    # transform from scratch, so each enemy ignores whatever
-                    # rotation/scale the marker prop happens to have and keeps
-                    # identity rotation + scale 1 (upright, full size).
-                    SpawnTranslation : vector3 = vector3{ Left := MarkerTranslation.Left + CurrentOffset, Up := MarkerTranslation.Up, Forward := MarkerTranslation.Forward }
+                    # Pick a random spot in the zone, keeping clear of the
+                    # enemies already placed this wave.
+                    #
+                    # We rebuild the transform from scratch around that
+                    # translation, so each enemy ignores whatever rotation/scale
+                    # the corner props happen to have and keeps identity
+                    # rotation + scale 1 (upright, full size).
+                    SpawnTranslation : vector3 = PickSpawnPosition(Zone, PlacedPositions)
                     SpawnTransform : transform = transform{ Translation := SpawnTranslation }
                     Enemy.SetGlobalTransform(SpawnTransform)
+
+                    # Remember it so the next enemy of this wave avoids it.
+                    set PlacedPositions += array{ SpawnTranslation }
 
                     # Give the enemy its health.
                     #
@@ -310,8 +417,6 @@ wave_manager := class(creative_device):
                     # keeps growing with dead enemies too - see the field comment.
                     set SpawnedEnemies += array{ Enemy }
 
-                    set CurrentOffset += EnemySpacing
-
                 # Seed the live count from the enemies we are actually watching.
                 # Assigned once, after the loop: no death can have happened yet,
                 # because nothing has damaged anyone.
@@ -319,7 +424,7 @@ wave_manager := class(creative_device):
 
                 Print("Wave {CurrentWaveNumber} spawned - {LiveEnemyCount} enemies alive")
             else:
-                Print("WARNING: SpawnMarker is not assigned - place a prop in the level and assign it in the wave_manager Details panel")
+                Print("WARNING: spawn area not defined - assign BOTH SpawnAreaCornerA and SpawnAreaCornerB in the wave_manager Details panel")
         else:
             Print("WARNING: no simulation entity available - cannot spawn")
 
