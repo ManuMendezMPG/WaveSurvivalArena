@@ -154,6 +154,23 @@ wave_manager := class(creative_device):
     @editable
     DamagePerHit : float = 34.0
 
+    # The crop's health at the start of a run. What the player is defending.
+    @editable
+    CropMaxHealth : float = 100.0
+
+    # How much crop health one cow destroys by reaching the pasture. At the
+    # defaults, five arrivals wipe the crop out.
+    @editable
+    CropDamagePerCow : float = 20.0
+
+    # Crop health right now. Starts at 0.0 only because a field needs SOME
+    # default; the real value is assigned in OnStartPressed - see there for why
+    # that spot and not StartWave.
+    #
+    # Nothing reads it before then: it takes a wave to produce a cow, and a wave
+    # only exists after Start.
+    var CropHealth : float = 0.0
+
     # EVERYTHING spawned in the current wave, alive or dead. This is NOT the
     # live-enemy list: dead enemies stay in here until the whole wave is
     # cleared. Its only job is to give ClearCurrentWave something to sweep, and
@@ -243,6 +260,18 @@ wave_manager := class(creative_device):
     # from wave 1, including after a victory - StartWave has no precondition.
     OnStartPressed(InAgent : agent) : void =
         Print("Start button pressed - restarting the run at wave 1")
+
+        # Reset the crop HERE and not in StartWave, because this is the only
+        # entry point that begins a RUN. StartWave is shared: the button calls
+        # it for wave 1, but ChainNextWave also calls it for every wave after -
+        # so resetting there would heal the crop back to full at the start of
+        # each wave and the damage would never accumulate across the run.
+        #
+        # The crop is run-scoped state. Enemies and their counters are
+        # wave-scoped. Those two lifetimes reset in two different places.
+        set CropHealth = CropMaxHealth
+        Print("Crop restored to {CropHealth} health")
+
         StartWave(1)
 
     # Builds a spawn_zone from two props placed at opposite corners.
@@ -696,7 +725,19 @@ wave_manager := class(creative_device):
             Generation = WaveGeneration
             Enemy.GetParent[]
         then:
-            Print("cow reached the pasture")
+            # The cow eats. Max clamps at 0 so the crop never goes negative.
+            #
+            # NO DATA RACE, even with several cows landing in the same instant.
+            # Verse is cooperatively scheduled on one thread: a task runs from
+            # resume to its next suspension point without interruption, and
+            # there is no Await or Sleep between reading CropHealth, writing it
+            # and logging it. Arrivals are therefore processed one after the
+            # other, never interleaved, and no subtraction can be lost.
+            set CropHealth = Max(0.0, CropHealth - CropDamagePerCow)
+
+            # Reaching 0 has no consequence yet - the defeat condition is the
+            # next step. For now the crop simply sits at 0.
+            Print("cow reached the pasture - crop health: {CropHealth} / {CropMaxHealth}")
 
     # One instance of this task runs per living enemy, parked on Await() until
     # that specific enemy dies. Launched by the spawn loop via `spawn`.
