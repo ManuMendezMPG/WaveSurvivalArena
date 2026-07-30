@@ -348,11 +348,13 @@ wave_manager := class(creative_device):
     # path on the entity's CURRENT transform, which is why callers must place
     # the enemy with SetGlobalTransform BEFORE calling this.
     #
-    # Fully synchronous: SetKeyframes and Play both return void and neither
-    # suspends, so the engine does the animating and no task is spawned. That is
-    # what keeps StartWave atomic and leaves the generation stamping untouched -
-    # there is no movement task that could go stale.
-    MoveEnemyToPasture(Enemy : entity, CurrentPosition : vector3, Target : vector3) : void =
+    # The movement itself is synchronous: SetKeyframes and Play both return void
+    # and neither suspends, so the engine does the animating. The one task this
+    # starts (WatchEnemyArrival) is launched with `spawn`, which also does not
+    # suspend, so StartWave stays atomic either way.
+    #
+    # `Generation` is only carried through to stamp that arrival task.
+    MoveEnemyToPasture(Enemy : entity, CurrentPosition : vector3, Target : vector3, Generation : int) : void =
         # Speed guards the division below. Zero or negative means "stay put",
         # which is a legitimate setting, so we skip rather than substitute some
         # made-up duration the designer never asked for.
@@ -396,6 +398,12 @@ wave_manager := class(creative_device):
 
                 MovementComp.SetKeyframes(array{ Keyframe }, oneshot_keyframed_movement_playback_mode{})
                 MovementComp.Play()
+
+                # Start listening for the end of THIS journey. Launched from
+                # here, rather than from the spawn loop, because this is where
+                # the movement component is already in hand and where we know
+                # the animation actually started.
+                spawn { WatchEnemyArrival(Enemy, MovementComp, Generation) }
 
                 Print("Enemy walking to pasture - {TravelDistance} cm over {TravelDuration} s")
             else:
@@ -612,7 +620,7 @@ wave_manager := class(creative_device):
                             Scale := SpawnScale
                         Enemy.SetGlobalTransform(FacingTransform)
 
-                        MoveEnemyToPasture(Enemy, SpawnTranslation, PastureTarget)
+                        MoveEnemyToPasture(Enemy, SpawnTranslation, PastureTarget, ThisGeneration)
 
                         # Remember it so the next enemy aims somewhere else.
                         set PastureTargets += array{ PastureTarget }
@@ -655,6 +663,40 @@ wave_manager := class(creative_device):
                 Print("WARNING: a tracked enemy has no health_component - cannot damage it")
 
         Print("Damage pass done - {LiveEnemyCount} still alive")
+
+    # One instance of this task runs per walking enemy, parked until that
+    # enemy's journey to the pasture ends. Launched by MoveEnemyToPasture.
+    #
+    # FinishedEvent is a `listenable(tuple())` (Verse.digest.verse:670-671).
+    # Being engine-provided it supports both Await and Subscribe; we use Await
+    # because the payload is EMPTY, so a Subscribe callback would have no way of
+    # telling which enemy arrived. Inside a task, the task itself is the context.
+    # The empty payload is simply discarded.
+    #
+    # Same no-cancellation caveat as WatchEnemyDeath: if the enemy dies before
+    # arriving, this task may park forever. Unlike the death watcher, that now
+    # happens in NORMAL play rather than only when a wave is abandoned. Accepted
+    # for this step; racing the two watchers against each other is the fix and
+    # is a separate step.
+    WatchEnemyArrival(Enemy : entity, MovementComp : keyframed_movement_component, Generation : int)<suspends> : void =
+        MovementComp.FinishedEvent.Await()
+
+        # Guard 1: the wave this enemy belonged to must still be the current one.
+        #
+        # Guard 2: the enemy must still be in the scene. GetParent[] is failable
+        # and the digest says it "fails if there is currently no parent entity" -
+        # which is exactly the state RemoveFromParent leaves a dead enemy in. So
+        # this is a direct liveness test, with no coordination with the death
+        # watcher needed.
+        #
+        # That second guard matters because it is NOT documented whether the
+        # engine fires FinishedEvent when an entity is removed mid-animation. If
+        # it does, this check is what stops a corpse from reporting an arrival.
+        if:
+            Generation = WaveGeneration
+            Enemy.GetParent[]
+        then:
+            Print("cow reached the pasture")
 
     # One instance of this task runs per living enemy, parked on Await() until
     # that specific enemy dies. Launched by the spawn loop via `spawn`.

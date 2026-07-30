@@ -20,32 +20,54 @@ the assets are used with their grain, not against it.
 
 ## Current status (learning prototype)
 
-Built and working as of the current phase:
+Built and working:
 
-- Wave spawning as Scene Graph entities, with editable count, spacing and marker.
+- Wave spawning as Scene Graph entities (cow prefab `P_Cow`), scattered
+  randomly without overlap inside a rectangular **spawn zone** defined by two
+  editable corner props (`spawn_zone` struct + `MakeZoneFromCorners`).
 - Per-enemy `health_component` (max health, `ApplyDamage`, `EliminatedEvent`).
 - Damage application and elimination of dead enemies.
 - Automatic wave chaining with scaling difficulty and a win condition
   (`MaxWaves`), protected by a generation-sealing mechanism against stale tasks.
-- Enemy visual = cow prefab (`P_Cow`).
+- Per-enemy async death watchers + atomic live counter for wave-clear detection.
+- Editable uniform enemy scale.
+- **Pasture zone** defined the same way (two corner props), reusing `spawn_zone`.
+- Enemies **move in a straight line toward the pasture** via keyframed movement
+  (`keyframed_movement_component`), each to its own randomized target, at an
+  editable speed, and **oriented toward their direction of travel** (yaw from
+  `ArcTan`, with an editable facing offset to correct for the asset's model).
 
-This foundation is **mechanic-complete for a demo** but cosmetic and abstract
-(damage comes from a button, not from gameplay).
+This is **mechanic-complete for a demo**. The main remaining abstraction is
+that damage still comes from a debug button, not from real gameplay.
+
+### Known limitations (by design, for now)
+- Movement is straight-line only — no navigation/pathfinding exists in the SDK.
+  Spawn and pasture zones must have clear line of sight between them.
+- Kinematic keyframe movement likely ignores collisions, so cows may pass
+  through each other and through geometry.
+- Orphaned death-watcher tasks leak if a wave is restarted mid-flight (tasks
+  can't be cancelled in this SDK version). Acceptable; a `race`-based fix is
+  noted for later.
 
 ## Roadmap phases (post-demo)
 
 ### Phase A — From "button damage" to real gameplay
-- Replace the debug damage button with a real damage source.
-- Cows should **advance toward the crop** rather than stand still (movement
-  component, likely built on the existing `SimpleMovementComponent`).
-- Player action to stop cows: proximity/zone damage, or a projectile if the
-  player gets a weapon.
+- [DONE] Cows now **advance toward the pasture** instead of standing still
+  (keyframed movement, oriented, per-enemy targets).
+- [TODO] Replace the debug damage button with a real damage source: proximity/
+  zone damage as the player approaches cows, or a projectile if the player
+  gets a weapon.
 
 ### Phase B — The crop to protect
-- Introduce **grass/crop entities** placed in the level as the defense target.
-- Cows that reach the crop damage or consume it (lose condition tied to crop
-  health, not player health).
-- Simple visual feedback for crop state (healthy → eaten).
+- [PARTIAL] The **pasture zone** already exists and cows already move toward it.
+  What's missing is making it a real defense target rather than just a
+  destination.
+- [TODO] Introduce **grass/crop entities** in the pasture as the thing to protect.
+- [TODO] Cows that reach the pasture damage or consume the crop (lose condition
+  tied to crop health, not player health) — currently cows just arrive and stop.
+- [TODO] Simple visual feedback for crop state (healthy → eaten).
+- [FUTURE] Multiple pasture zones, with each cow heading to the nearest one
+  (the `spawn_zone` design already makes multiple zones cheap to add).
 
 ### Phase C — Planting and growth
 - Let the player **plant new grass** during or between waves.
