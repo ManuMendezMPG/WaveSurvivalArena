@@ -95,8 +95,45 @@ enemy_interaction_handler := class:
     # immediately, so the spawn loop stays atomic. The returned `cancelable` is
     # ignored, the same as every other Subscribe in this project - the
     # subscription is meant to last as long as the component does.
+    # All three events of the interaction lifecycle are wired, not just the one
+    # that kills: with a hold duration in play, "did the hold start" and "was it
+    # canceled" are the two questions the log has to be able to answer. Without
+    # them a hold that never begins and a hold that begins and gets interrupted
+    # look identical from the outside - nothing happens in both cases.
+    #
+    # All three carry the same agent payload and the same per-cow association, so
+    # they all resolve to THIS handler's cow. See the class comment.
     Attach(Interactable : interactable_component) : void =
+        Interactable.StartedEvent.Subscribe(OnInteractStarted)
         Interactable.SucceededEvent.Subscribe(OnInteractSucceeded)
+        Interactable.CanceledEvent.Subscribe(OnInteractCanceled)
+
+    # Runs when a player BEGINS holding the interact key on this cow.
+    #
+    # Log-only on purpose - the cow is not damaged, slowed or marked yet. With a
+    # hold duration configured this fires on key-down and the native Fortnite
+    # progress bar appears; with no duration it would be indistinguishable from
+    # OnInteractSucceeded (the digest says the two events are identical when
+    # InteractDuration is at or below 0), which is exactly the difference this
+    # sub-step introduces.
+    OnInteractStarted(InAgent : agent) : void =
+        Print("Interaction started on enemy {EnemyIndex} - hold to complete")
+
+    # Runs when a hold ends WITHOUT completing: the player released the key,
+    # walked out of range, or something else interrupted it.
+    #
+    # Log-only as well, and deliberately so: an abandoned hold must leave the cow
+    # in exactly the state it was in before, which is what "no state was touched
+    # in OnInteractStarted" already guarantees. There is nothing to undo.
+    #
+    # NOTE - the digest warns that the base interactable_component "cannot be
+    # canceled" and that CanceledEvent exists for subclasses to fire. That is not
+    # a problem here: the subclass we attach is basic_interactable_component, and
+    # its InteractableDuration is documented as cancelable while the duration is
+    # active. So this only ever fires because the duration exists, which makes it
+    # a direct test that the hold is real.
+    OnInteractCanceled(InAgent : agent) : void =
+        Print("Interaction canceled on enemy {EnemyIndex} - hold not completed")
 
     # Runs when a player finishes interacting with THIS cow.
     #
@@ -236,6 +273,16 @@ wave_manager := class(creative_device):
     # one-hit kill regardless of how health is tuned later.
     @editable
     InteractKillDamage : float = 100000.0
+
+    # How long a player must HOLD the interact key on a cow to kill it, in
+    # seconds. Fed into the interactable's interactable_duration, which is what
+    # drives Fortnite's native hold progress bar.
+    #
+    # 0.0 or less is legal and means "instant", per the digest - it reverts the
+    # behaviour to what sub-step 1 shipped. So this dial can turn the hold off
+    # without touching code.
+    @editable
+    InteractHoldSeconds : float = 2.0
 
     # The crop's health at the start of a run. What the player is defending.
     @editable
@@ -564,9 +611,11 @@ wave_manager := class(creative_device):
     # the composable feature set (cooldowns, duration, success limits) that later
     # sub-steps will need.
     #
-    # No InteractableDuration is configured yet, so the interaction succeeds the
-    # instant the key is pressed: with a duration at or below 0 the digest says
-    # StartedEvent and SucceededEvent are identical. Hold-to-milk comes later.
+    # The interaction is a HOLD, not a key press: InteractableDuration carries an
+    # interactable_duration whose InteractDuration is InteractHoldSeconds, which
+    # is what makes Fortnite draw its native progress bar and lets the hold be
+    # canceled midway. See ConfigureHoldDuration for why the value is also
+    # re-applied after construction.
     #
     # Nothing here suspends, so StartWave stays atomic.
     AttachEnemyInteraction(Enemy : entity, EnemyHealthComp : health_component, Index : int) : void =
@@ -576,7 +625,28 @@ wave_manager := class(creative_device):
             Print("Enemy {Index} already had an interactable_component")
         else:
             Print("Enemy {Index} had no interactable_component - adding a basic_interactable_component")
-            Enemy.AddComponents(array{ basic_interactable_component{ Entity := Enemy } })
+
+            # `?interactable_duration` is an OPTION field, so the value has to be
+            # wrapped: `option{ ... }` is the constructor (same form as
+            # FindSweepHitsExampleComponent.verse:62), and a bare `false` would be
+            # the empty option. Assigning the interactable_duration directly would
+            # be a type error - Verse does not auto-wrap into an option.
+            #
+            # interactable_duration is `class<concrete>`, so `interactable_duration{}`
+            # alone would be legal too; we override InteractDuration in the
+            # archetype and leave MaxSimultaneousInteractors at its default
+            # (unlimited), which is right while only one player is testing.
+            HoldDuration : interactable_duration = interactable_duration:
+                InteractDuration := InteractHoldSeconds
+
+            NewInteractable : basic_interactable_component = basic_interactable_component:
+                Entity := Enemy
+                InteractableDuration := option{ HoldDuration }
+
+            Enemy.AddComponents(array{ NewInteractable })
+
+        # Make sure the hold duration is actually in effect, whichever branch ran.
+        ConfigureHoldDuration(Enemy, Index)
 
         # Fetch it again: present now by either route.
         if:
@@ -595,6 +665,40 @@ wave_manager := class(creative_device):
             Print("Enemy {Index} is now interactable - one interaction deals {InteractKillDamage} damage")
         else:
             Print("WARNING: enemy {Index} has no interactable_component after AddComponents - it cannot be killed by hand")
+
+    # Forces this cow's hold length to InteractHoldSeconds and reports what it
+    # found. Called for every enemy, right after the attach step.
+    #
+    # WHY THIS EXISTS AT ALL, given the archetype above already sets the duration:
+    #
+    #   1. `InteractableDuration` is NOT a `var` in the digest, so it can only
+    #      ever be assigned at construction. When the prefab brings its own
+    #      interactable, we never construct it - so the archetype above cannot
+    #      reach it and the editable value would silently do nothing on that path.
+    #      The inner `InteractDuration` IS a var, so going one level deeper is the
+    #      only way in. (Same trick as LanternInteractionComponent.verse:23,
+    #      writing a var field through a reference we did not build.)
+    #
+    #   2. It turns the setting into something the log can PROVE. The archetype
+    #      only records what we asked for; this reads the value back off the live
+    #      component, so a wrong or missing duration shows up on the first run
+    #      instead of being debugged through the progress bar.
+    #
+    # The lookup is for basic_interactable_component specifically, not the base
+    # interactable_component, because InteractableDuration is declared on the
+    # subclass. A prefab shipping some other interactable variant therefore lands
+    # in the else branch and keeps whatever timing it was authored with.
+    ConfigureHoldDuration(Enemy : entity, Index : int) : void =
+        if:
+            BasicInteractable := Enemy.GetComponent[basic_interactable_component]
+            # `?` unwraps the option, and FAILS when it is empty - so this line is
+            # both the unwrap and the "does it have a duration at all" test.
+            HoldDuration := BasicInteractable.InteractableDuration?
+        then:
+            set HoldDuration.InteractDuration = InteractHoldSeconds
+            Print("Enemy {Index} hold duration is {HoldDuration.InteractDuration} s")
+        else:
+            Print("Enemy {Index} has no interactable_duration - its interaction will be immediate")
 
     # Spawns wave `WaveNumber`. THE single spawn path: both the button and the
     # automatic chaining go through here, so the spawn logic exists once.
