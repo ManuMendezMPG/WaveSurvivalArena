@@ -41,6 +41,83 @@ spawn_zone := struct:
     MaxForward : float
     Up : float
 
+# One instance of this per living enemy. It exists for exactly one reason: to
+# answer "which cow was that?" when an interaction succeeds.
+#
+# THE PROBLEM. interactable_component.SucceededEvent is a `listenable(agent)`,
+# so its payload is the PLAYER who interacted, not the cow that was interacted
+# with. A single shared handler on wave_manager would therefore receive "player
+# X finished an interaction" and have no way to tell which of the five cows in
+# the field it belonged to.
+#
+# THE SOLUTION - one handler OBJECT per cow, holding that cow's own
+# health_component as a field. Verse has no closures to capture a variable at
+# subscription time, so the captured state is made explicit: this object IS the
+# capture. The subscription is per component (each cow has its own interactable,
+# each interactable gets its own handler), so when SucceededEvent fires, the
+# handler that runs is the one belonging to that cow, and `HealthComp` is
+# already the right cow's health. No lookup, no search, no ambiguity.
+#
+# Why it stores the health_component and not the entity: the handler's only job
+# is to damage, and holding the component directly removes a GetComponent[]
+# failure case from the hot path. The entity is still reachable as
+# HealthComp.Entity if it is ever needed.
+#
+# WHY Subscribe IS CALLED FROM INSIDE THIS CLASS (the Attach method) rather
+# than from wave_manager: passing `OnInteractSucceeded` unqualified inside the
+# class body is the same shape already proven to compile in this project -
+# `StartButton.InteractedWithEvent.Subscribe(OnStartPressed)` in OnBegin, and
+# `InteractableComponent.SucceededEvent.Subscribe(OnInteractFinished)` in
+# LanternInteractionComponent.verse:19. wave_manager just builds the handler and
+# calls Attach; it never needs to name a method on someone else's instance.
+#
+# Lifetime: nothing in wave_manager keeps a reference to these handlers. They
+# stay alive because the subscription holds the bound callback, which holds this
+# object - and the subscription itself is owned by the cow's interactable
+# component. Handler and cow therefore die together, which is exactly right.
+enemy_interaction_handler := class:
+
+    # The health of the ONE cow this handler speaks for. Set at construction and
+    # never reassigned - this is the whole association mechanism.
+    HealthComp : health_component
+
+    # Damage applied on a successful interaction. Passed in rather than read
+    # from wave_manager so this class has no dependency on the device.
+    KillDamage : float
+
+    # Index within its wave. Log-only, so the output can be matched up with the
+    # spawn lines above it.
+    EnemyIndex : int
+
+    # Wires this handler to a cow's interactable component.
+    #
+    # Not <suspends> and not a task: Subscribe registers a callback and returns
+    # immediately, so the spawn loop stays atomic. The returned `cancelable` is
+    # ignored, the same as every other Subscribe in this project - the
+    # subscription is meant to last as long as the component does.
+    Attach(Interactable : interactable_component) : void =
+        Interactable.SucceededEvent.Subscribe(OnInteractSucceeded)
+
+    # Runs when a player finishes interacting with THIS cow.
+    #
+    # InAgent is the interacting player - received because the event sends it,
+    # and unused for now: the kill is not yet attributed to anyone.
+    #
+    # It only deals damage. Everything else is the existing death pipeline,
+    # untouched and reused: ApplyDamage -> EliminatedEvent ->
+    # WatchEnemyDeath -> RemoveFromParent -> OnEnemyDied -> the live counter and
+    # the wave/run endings. That reuse is why no guard is needed here for a
+    # finished run or a stale wave; OnEnemyDied already owns those checks.
+    #
+    # A huge KillDamage rather than the cow's exact remaining health so that one
+    # interaction is always lethal, whatever the health_component was tuned to
+    # and whatever the damage button already chipped off. (Passing
+    # HealthComp.MaxHealth would also always be lethal, but it re-couples the
+    # kill to a value a designer can lower.)
+    OnInteractSucceeded(InAgent : agent) : void =
+        Print("Interaction completed on enemy {EnemyIndex} - applying {KillDamage} lethal damage")
+        HealthComp.ApplyDamage(KillDamage)
+
 # Wave Manager: entry point for the arena's game flow.
 # Phase 1 goal: react to a button press. This is the core
 # device-to-Verse event pattern used throughout the project.
@@ -153,6 +230,12 @@ wave_manager := class(creative_device):
     # health_component default of 100 max health, 34.0 means three presses kill.
     @editable
     DamagePerHit : float = 34.0
+
+    # Damage applied to a single cow when a player completes an interaction with
+    # it. Deliberately far above any sane MaxHealth so an interaction is a
+    # one-hit kill regardless of how health is tuned later.
+    @editable
+    InteractKillDamage : float = 100000.0
 
     # The crop's health at the start of a run. What the player is defending.
     @editable
@@ -463,6 +546,56 @@ wave_manager := class(creative_device):
         else:
             Print("WARNING: EnemySpeed must be greater than 0 - enemy will not move")
 
+    # Makes one enemy killable by hand: gives it an interactable component and
+    # points a handler at its health.
+    #
+    # Same three-step shape as the movement wiring in MoveEnemyToPasture - check
+    # whether the prefab already brought one, create it if not, then read it back
+    # off the entity - so the driving code below exists once instead of being
+    # duplicated in both branches. Both branches log, so the first run tells us
+    # which case P_Cow actually is.
+    #
+    # The CHECK is for the base `interactable_component` while the thing ADDED is
+    # a `basic_interactable_component`. That asymmetry is intentional:
+    # SucceededEvent is declared on the base, so any interactable variant a
+    # prefab might ship (offer_interactable_component, an item pickup, ...) is
+    # good enough to subscribe to and must not be duplicated. basic_ is simply
+    # the plain subclass to add when there is nothing there - it is the one with
+    # the composable feature set (cooldowns, duration, success limits) that later
+    # sub-steps will need.
+    #
+    # No InteractableDuration is configured yet, so the interaction succeeds the
+    # instant the key is pressed: with a duration at or below 0 the digest says
+    # StartedEvent and SucceededEvent are identical. Hold-to-milk comes later.
+    #
+    # Nothing here suspends, so StartWave stays atomic.
+    AttachEnemyInteraction(Enemy : entity, EnemyHealthComp : health_component, Index : int) : void =
+        if:
+            ExistingInteractable := Enemy.GetComponent[interactable_component]
+        then:
+            Print("Enemy {Index} already had an interactable_component")
+        else:
+            Print("Enemy {Index} had no interactable_component - adding a basic_interactable_component")
+            Enemy.AddComponents(array{ basic_interactable_component{ Entity := Enemy } })
+
+        # Fetch it again: present now by either route.
+        if:
+            Interactable := Enemy.GetComponent[interactable_component]
+        then:
+            # Build this cow's own handler and hand it the cow's own health. See
+            # the enemy_interaction_handler comment for why the association has
+            # to be an object rather than a shared callback.
+            Handler : enemy_interaction_handler = enemy_interaction_handler:
+                HealthComp := EnemyHealthComp
+                KillDamage := InteractKillDamage
+                EnemyIndex := Index
+
+            Handler.Attach(Interactable)
+
+            Print("Enemy {Index} is now interactable - one interaction deals {InteractKillDamage} damage")
+        else:
+            Print("WARNING: enemy {Index} has no interactable_component after AddComponents - it cannot be killed by hand")
+
     # Spawns wave `WaveNumber`. THE single spawn path: both the button and the
     # automatic chaining go through here, so the spawn logic exists once.
     #
@@ -631,6 +764,15 @@ wave_manager := class(creative_device):
                         # wave is still the current one.
                         spawn { WatchEnemyDeath(AttachedHealthComp, ThisGeneration) }
                         set WatchedCount += 1
+
+                        # Make it killable by hand. Wired INSIDE this block, not
+                        # after it, for two reasons: AttachedHealthComp is the
+                        # health the handler must damage and it only exists here,
+                        # and an enemy with no health component could not die
+                        # anyway - giving it an interaction that visibly does
+                        # nothing would be worse than having no prompt at all.
+                        # That case already logs its own warning below.
+                        AttachEnemyInteraction(Enemy, AttachedHealthComp, Index)
                     else:
                         Print("WARNING: enemy {Index} has no health_component after AddComponents")
 

@@ -36,9 +36,22 @@ Built and working:
   (`keyframed_movement_component`), each to its own randomized target, at an
   editable speed, and **oriented toward their direction of travel** (yaw from
   `ArcTan`, with an editable facing offset to correct for the asset's model).
+- **Arrival detection** per enemy, awaiting the movement component's
+  `FinishedEvent`, guarded so a cow killed in transit never reports an arrival.
+- **Crop health** (`CropHealth`, with editable max and per-cow damage). Each cow
+  that reaches the pasture eats into it, clamped at zero. Crop health is
+  run-scoped: it resets when a run starts, not per wave, so damage accumulates
+  across the whole run.
+- A **complete game loop with both endings**: victory for surviving `MaxWaves`,
+  defeat when the crop reaches zero. Defeat announces itself, sweeps the
+  surviving cows out of the world and invalidates everything in flight.
+- Both endings close through a single shared latch (`RunHasEnded`), so they are
+  mutually exclusive and each fires exactly once even when several cows arrive
+  in the same instant. Pressing Start always begins a clean run.
 
-This is **mechanic-complete for a demo**. The main remaining abstraction is
-that damage still comes from a debug button, not from real gameplay.
+This is **mechanic-complete for a demo**: a full run can now be won or lost.
+The main remaining abstraction is that damage to cows still comes from a debug
+button, not from real gameplay.
 
 ### Known limitations (by design, for now)
 - Movement is straight-line only — no navigation/pathfinding exists in the SDK.
@@ -48,6 +61,15 @@ that damage still comes from a debug button, not from real gameplay.
 - Orphaned death-watcher tasks leak if a wave is restarted mid-flight (tasks
   can't be cancelled in this SDK version). Acceptable; a `race`-based fix is
   noted for later.
+- Arrival-watcher tasks leak the same way, but **during normal play**: every cow
+  killed before it reaches the pasture leaves one parked forever. Bounded and
+  harmless — the latch and generation seal neutralise their effects — but this
+  is the strongest argument for the `race` fix, which would cancel both watchers
+  at once.
+- The crop is **a number, not a thing in the world**. There is nothing to look
+  at, so its state is only visible in the log.
+- The debug damage button is not gated by `RunHasEnded`. Pressing it after a run
+  ends is harmless (the wave list is empty) but still logs a line.
 
 ## Roadmap phases (post-demo)
 
@@ -56,16 +78,21 @@ that damage still comes from a debug button, not from real gameplay.
   (keyframed movement, oriented, per-enemy targets).
 - [TODO] Replace the debug damage button with a real damage source: proximity/
   zone damage as the player approaches cows, or a projectile if the player
-  gets a weapon.
+  gets a weapon. **Not started** — this is now the single largest gap between
+  the prototype and something playable, and the only piece of the loop still
+  driven by a debug affordance.
 
 ### Phase B — The crop to protect
-- [PARTIAL] The **pasture zone** already exists and cows already move toward it.
-  What's missing is making it a real defense target rather than just a
-  destination.
-- [TODO] Introduce **grass/crop entities** in the pasture as the thing to protect.
-- [TODO] Cows that reach the pasture damage or consume the crop (lose condition
-  tied to crop health, not player health) — currently cows just arrive and stop.
-- [TODO] Simple visual feedback for crop state (healthy → eaten).
+- [DONE] The **pasture zone** exists (two editable corner props, reusing
+  `spawn_zone`) and cows move toward their own randomized point inside it.
+- [DONE] Cows that reach the pasture **consume the crop**: arrival is detected
+  per enemy and subtracts editable damage from `CropHealth`.
+- [DONE] **Lose condition tied to crop health**, not player health — the run
+  ends in defeat when the crop hits zero.
+- [TODO] Introduce **grass/crop entities** in the pasture as the thing to
+  protect. The crop is currently only a number; this gives it a body.
+- [TODO] Simple visual feedback for crop state (healthy → eaten), so the player
+  can read how the run is going without the log.
 - [FUTURE] Multiple pasture zones, with each cow heading to the nearest one
   (the `spawn_zone` design already makes multiple zones cheap to add).
 
