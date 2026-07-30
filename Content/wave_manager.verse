@@ -41,6 +41,31 @@ spawn_zone := struct:
     MaxForward : float
     Up : float
 
+# The text Fortnite shows in the interaction prompt while a player is able to
+# start the hold on a cow.
+#
+# WHY <localizes> AND NOT A PLAIN string: `message` is declared
+# `class<epic_internal>` (Verse.digest.verse:2096), so `message{}` cannot be
+# constructed from our code, and the factory the engine itself uses -
+# `MakeMessageInternal` (:2123) - is `epic_internal` too. There is no third door.
+# The `<localizes>` specifier IS the route from Verse source to a `message`
+# value: it tells the compiler to register this literal for translation and hand
+# back a message built through that internal factory.
+#
+# CONFIDENCE. The specifier is real and legal on a message-typed definition - the
+# digests use it themselves, at Fortnite.digest.verse:19 and
+# UnrealEngine.digest.verse:1020, both `DefaultText<localizes>...:message`. What
+# the digests cannot show is the syntax of a definition we WRITE, because every
+# declaration in them is native with an `= external {}` body. So the shape below
+# (a data definition whose body is a string literal) is the one genuinely
+# unverified line in this sub-step. It is also trivially revertible - see the
+# note on ConfigureInteractPrompt.
+#
+# NO KEY NAME IN THE TEXT. "Sedate the cow", not "Hold E to sedate the cow":
+# Fortnite draws the key or the gamepad glyph itself next to this label, so a
+# hardcoded "E" would be wrong on a controller and duplicated on a keyboard.
+SedateCowPrompt<localizes> : message = "Sedate the cow"
+
 # One instance of this per living enemy. It exists for exactly one reason: to
 # answer "which cow was that?" when an interaction succeeds.
 #
@@ -648,6 +673,9 @@ wave_manager := class(creative_device):
         # Make sure the hold duration is actually in effect, whichever branch ran.
         ConfigureHoldDuration(Enemy, Index)
 
+        # Cosmetic only, and safe to delete on its own - see the function.
+        ConfigureInteractPrompt(Enemy, Index)
+
         # Fetch it again: present now by either route.
         if:
             Interactable := Enemy.GetComponent[interactable_component]
@@ -699,6 +727,46 @@ wave_manager := class(creative_device):
             Print("Enemy {Index} hold duration is {HoldDuration.InteractDuration} s")
         else:
             Print("Enemy {Index} has no interactable_duration - its interaction will be immediate")
+
+    # Replaces the engine's generic interaction prompt with our own text.
+    #
+    # PURELY COSMETIC, AND DELIBERATELY ISOLATED. Nothing else in the file depends
+    # on this running, and the interaction works identically without it - it just
+    # shows the default prompt. If `SedateCowPrompt` turns out not to compile, the
+    # whole feature reverts by deleting three things and nothing else moves:
+    # this function, its one call in AttachEnemyInteraction, and the
+    # SedateCowPrompt definition at the top of the file.
+    #
+    # CanInteractMessage is a `var` in the digest, unlike InteractableDuration, so
+    # it can be written after construction - which is why this needs no change to
+    # the archetype and works on the prefab-already-had-one path too. It is also
+    # `@editable`, so a designer could set it in the Details panel on a
+    # hand-placed interactable; runtime-added components like ours have no panel,
+    # hence doing it in code.
+    #
+    # It is gated `@available {MinUploadedAtFNVersion := 4020}`. The digests here
+    # are generated from Fortnite Release-41.30, comfortably past that, so the
+    # member exists - but this is the second thing to suspect if the build
+    # complains, after the <localizes> syntax itself.
+    #
+    # Only the CAN-interact message is set. The digest also exposes
+    # CannotInteractMessage, shown when CanInteract fails; we never fail
+    # CanInteract, so it would be dead text.
+    ConfigureInteractPrompt(Enemy : entity, Index : int) : void =
+        if:
+            BasicInteractable := Enemy.GetComponent[basic_interactable_component]
+        then:
+            set BasicInteractable.CanInteractMessage = SedateCowPrompt
+
+            # Read it BACK and Localize it for the log, rather than logging the
+            # literal we just wrote. Localize (Verse.digest.verse:2099) is the
+            # public message -> string direction and is the only way to see a
+            # message's content from code, so this proves two things at once: the
+            # assignment landed on the live component, and the message resolves to
+            # the text we expect instead of an empty or missing translation.
+            Print("Enemy {Index} interact prompt set to: {Localize(BasicInteractable.CanInteractMessage)}")
+        else:
+            Print("Enemy {Index} has no basic_interactable_component - keeping the engine's default prompt")
 
     # Spawns wave `WaveNumber`. THE single spawn path: both the button and the
     # automatic chaining go through here, so the spawn logic exists once.
