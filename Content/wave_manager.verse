@@ -171,6 +171,23 @@ wave_manager := class(creative_device):
     # only exists after Start.
     var CropHealth : float = 0.0
 
+    # One-shot latch: true once the run has finished, by EITHER ending.
+    #
+    # It covers victory as well as defeat on purpose. Without that, the last
+    # enemy of the final wave dying at the same moment another cow reaches the
+    # crop would print "you win" AND "game over" - you would win and lose at
+    # once. Whichever ending fires first now closes the door on the other.
+    #
+    # It is also what makes each ending fire only ONCE: several cows can arrive
+    # in the same instant, and without a latch each of them would see a crop
+    # already at 0 and announce the defeat again. Same idea as the
+    # `CurrentHealth > 0.0` guard in health_component, one level up.
+    #
+    # Distinct from WaveGeneration by design: the generation answers "which wave
+    # do you belong to", which cannot express "the run is over" - a fresh
+    # generation is exactly what a new wave looks like.
+    var RunHasEnded : logic = false
+
     # EVERYTHING spawned in the current wave, alive or dead. This is NOT the
     # live-enemy list: dead enemies stay in here until the whole wave is
     # cleared. Its only job is to give ClearCurrentWave something to sweep, and
@@ -271,6 +288,12 @@ wave_manager := class(creative_device):
         # wave-scoped. Those two lifetimes reset in two different places.
         set CropHealth = CropMaxHealth
         Print("Crop restored to {CropHealth} health")
+
+        # Unlatch, so a run that ended in victory or defeat can be played again.
+        # StartWave deliberately has no precondition, so it does not matter how
+        # the previous run finished - and the generation bump inside it
+        # invalidates anything still in flight from it.
+        set RunHasEnded = false
 
         StartWave(1)
 
@@ -721,9 +744,12 @@ wave_manager := class(creative_device):
         # That second guard matters because it is NOT documented whether the
         # engine fires FinishedEvent when an entity is removed mid-animation. If
         # it does, this check is what stops a corpse from reporting an arrival.
+        # Guard 3: the run must still be going. After either ending, arrivals
+        # stop counting entirely - no crop damage, not even a log line.
         if:
             Generation = WaveGeneration
             Enemy.GetParent[]
+            not RunHasEnded?
         then:
             # The cow eats. Max clamps at 0 so the crop never goes negative.
             #
@@ -735,9 +761,30 @@ wave_manager := class(creative_device):
             # other, never interleaved, and no subtraction can be lost.
             set CropHealth = Max(0.0, CropHealth - CropDamagePerCow)
 
-            # Reaching 0 has no consequence yet - the defeat condition is the
-            # next step. For now the crop simply sits at 0.
             Print("cow reached the pasture - crop health: {CropHealth} / {CropMaxHealth}")
+
+            # DEFEAT. The `not RunHasEnded?` here is belt and braces: the guard
+            # above already established it, and nothing in between suspends. It
+            # is kept so this block is correct on its own terms if the code above
+            # is ever rearranged.
+            if:
+                CropHealth <= 0.0
+                not RunHasEnded?
+            then:
+                # Latch FIRST, before anything else can re-enter.
+                set RunHasEnded = true
+                Print("Game over - the crop was destroyed")
+
+                # Sweep the surviving cows out of the world, so the end of the
+                # run is unambiguous on screen and the field is clean for the
+                # next Start.
+                ClearCurrentWave()
+
+                # Defence in depth: bumping the generation invalidates every
+                # stamped thing still in flight in one stroke - death watchers,
+                # other arrival watchers, and any ChainNextWave still sleeping -
+                # without relying on each of them remembering to check the latch.
+                set WaveGeneration += 1
 
     # One instance of this task runs per living enemy, parked on Await() until
     # that specific enemy dies. Launched by the spawn loop via `spawn`.
@@ -775,7 +822,15 @@ wave_manager := class(creative_device):
         # and nothing signals its event), but comparing stamps turns that from
         # "should not happen" into "cannot happen": an old stamp means an old
         # wave, and old waves may not touch the current counter.
-        if (Generation = WaveGeneration):
+        #
+        # The second test stops a death from counting once the run is over. It
+        # matters most in the reverse of the race below: if the crop falls first,
+        # enemies dying immediately afterwards must not go on to declare a wave
+        # cleared, or worse, a victory.
+        if:
+            Generation = WaveGeneration
+            not RunHasEnded?
+        then:
             set LiveEnemyCount -= 1
             Print("Enemy eliminated - {LiveEnemyCount} enemies left alive")
 
@@ -789,6 +844,11 @@ wave_manager := class(creative_device):
                 # the Start button able to restart from wave 1 at any time,
                 # including after a win.
                 if (CurrentWaveNumber >= MaxWaves):
+                    # VICTORY. Latch here too, not just on defeat: a cow may be
+                    # a fraction of a second from reaching the crop as the final
+                    # enemy dies, and without this the arrival would go on to
+                    # announce a defeat straight after the win.
+                    set RunHasEnded = true
                     Print("All {MaxWaves} waves survived - you win!")
                 else:
                     # Hand the wait to a separate task so THIS function stays
@@ -801,10 +861,18 @@ wave_manager := class(creative_device):
     ChainNextWave(FromGeneration : int)<suspends> : void =
         Sleep(TimeBetweenWaves)
 
-        # Re-check the stamp AFTER sleeping. During those seconds the player may
-        # have pressed Start, which bumps WaveGeneration; chaining anyway would
-        # wipe the wave they just asked for and skip ahead a number.
-        if (FromGeneration = WaveGeneration):
+        # Re-check AFTER sleeping - this is the one place in the codebase where
+        # seconds of real time pass mid-function, so anything may have changed.
+        #
+        # The stamp catches the player pressing Start during the break, which
+        # bumps WaveGeneration; chaining anyway would wipe the wave they just
+        # asked for and skip ahead a number. The latch catches the run ending
+        # during the break, which is exactly what a cow reaching the crop while
+        # the field is empty between waves would do.
+        if:
+            not RunHasEnded?
+            FromGeneration = WaveGeneration
+        then:
             StartWave(CurrentWaveNumber + 1)
         else:
-            Print("Wave chain cancelled - a new wave was started during the break")
+            Print("Wave chain cancelled - the run ended, or a new wave was started, during the break")
