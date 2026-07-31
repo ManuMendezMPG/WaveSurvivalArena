@@ -106,13 +106,48 @@ enemy_interaction_handler := class:
     # never reassigned - this is the whole association mechanism.
     HealthComp : health_component
 
-    # Damage applied on a successful interaction. Passed in rather than read
-    # from wave_manager so this class has no dependency on the device.
+    # The interactable of that same cow, so a completed sedation can switch the
+    # prompt off. Held as a field rather than looked up at event time because
+    # AttachEnemyInteraction already has it in hand when it builds this handler -
+    # it is inside the `if` that found it - so storing it removes a lookup that
+    # could fail. The movement component is the odd one out and must stay a lazy
+    # lookup, but only because of the spawn-loop ordering; see OnInteractStarted.
+    InteractableComp : interactable_component
+
+    # Damage applied on a successful interaction. Large enough to always take the
+    # cow to 0 health in one go. Passed in rather than read from wave_manager so
+    # this class has no dependency on the device.
+    #
+    # NOTE ON THE NAME: since 4b this damage SEDATES rather than kills - it is the
+    # vehicle that drives health to 0 so the single "no longer a threat" channel
+    # fires. The name is kept because the editable feeding it, InteractKillDamage,
+    # is assigned in the UEFN Details panel, and renaming an @editable makes the
+    # editor lose the designer's value.
     KillDamage : float
 
     # Index within its wave. Log-only, so the output can be matched up with the
     # spawn lines above it.
     EnemyIndex : int
+
+    # True while THIS handler is the reason its cow is standing still.
+    #
+    # A one-shot latch, not a toggle: OnInteractStarted raises it only when it
+    # genuinely paused a moving cow, and OnInteractCanceled consumes it. That is
+    # what makes "resume" impossible to get wrong, because Play() is only ever
+    # called to undo a Pause() this handler actually performed.
+    #
+    # It matters because Play() on a cow that was NOT paused by a hold is a real
+    # hazard, not a no-op. A cow that already reached the pasture has a FINISHED
+    # animation and is still interactable, and the digest does not specify what
+    # Play() does to a finished one-shot - if it replays it, that cow walks the
+    # route again and damages the crop a second time. This latch means we never
+    # find out.
+    #
+    # Per COW, not per agent: MaxSimultaneousInteractors is unset (unlimited), so
+    # two players can hold the same cow at once. "Is this cow paused because of a
+    # hold" is a property of the cow, so one flag per handler is the right
+    # granularity. See OnInteractStarted for what the overlap actually does.
+    var DidPauseForHold : logic = false
 
     # Wires this handler to a cow's interactable component.
     #
@@ -128,28 +163,67 @@ enemy_interaction_handler := class:
     #
     # All three carry the same agent payload and the same per-cow association, so
     # they all resolve to THIS handler's cow. See the class comment.
-    Attach(Interactable : interactable_component) : void =
-        Interactable.StartedEvent.Subscribe(OnInteractStarted)
-        Interactable.SucceededEvent.Subscribe(OnInteractSucceeded)
-        Interactable.CanceledEvent.Subscribe(OnInteractCanceled)
+    Attach() : void =
+        InteractableComp.StartedEvent.Subscribe(OnInteractStarted)
+        InteractableComp.SucceededEvent.Subscribe(OnInteractSucceeded)
+        InteractableComp.CanceledEvent.Subscribe(OnInteractCanceled)
 
-    # Runs when a player BEGINS holding the interact key on this cow.
+    # Runs when a player BEGINS holding the interact key on this cow, and freezes
+    # the cow where it stands so it cannot walk out of the player's reach mid-hold.
     #
-    # Log-only on purpose - the cow is not damaged, slowed or marked yet. With a
-    # hold duration configured this fires on key-down and the native Fortnite
-    # progress bar appears; with no duration it would be indistinguishable from
-    # OnInteractSucceeded (the digest says the two events are identical when
-    # InteractDuration is at or below 0), which is exactly the difference this
-    # sub-step introduces.
+    # The cow is still not damaged or marked - only stopped. Nothing here is
+    # irreversible, which is what lets OnInteractCanceled put it back exactly as
+    # it was.
+    #
+    # WHY THE MOVEMENT COMPONENT IS LOOKED UP HERE AND NOT HELD AS A FIELD: in the
+    # spawn loop, AttachEnemyInteraction runs BEFORE MoveEnemyToPasture, so the
+    # keyframed_movement_component does not exist yet when this handler is built -
+    # there is nothing to store. Reading it off the entity at event time also
+    # handles the no-pasture case for free: no pasture means no movement component,
+    # the lookup fails, and there is simply nothing to pause. The entity stays the
+    # single source of truth for its components, as everywhere else in this file.
+    #
+    # Pause(), never Stop(): the digest says Stop() "reset[s] transform to the
+    # initial state", which would teleport the cow back to its spawn point. Pause()
+    # resumes from the exact point it froze at.
+    #
+    # IsPlaying[] is part of the CONDITION, not an afterthought. Pausing something
+    # that is not playing would raise the latch and licence a later Play() on a
+    # cow that was standing still for some other reason - a finished route being
+    # the dangerous one. See the DidPauseForHold comment.
+    #
+    # MULTIPLE OVERLAPPING HOLDS: with two players on one cow, the first hold
+    # pauses and latches; the second finds IsPlaying[] already false, takes the
+    # else branch and changes nothing. The first cancel to arrive resumes the cow
+    # while the other player may still be holding - cosmetically imperfect, never
+    # incorrect. Capping MaxSimultaneousInteractors at 1 removes the overlap
+    # entirely and is on the list for a later sub-step.
     OnInteractStarted(InAgent : agent) : void =
         Print("Interaction started on enemy {EnemyIndex} - hold to complete")
+
+        if:
+            MovementComp := HealthComp.Entity.GetComponent[keyframed_movement_component]
+            MovementComp.IsPlaying[]
+        then:
+            MovementComp.Pause()
+            set DidPauseForHold = true
+            Print("Enemy {EnemyIndex} paused while the hold lasts")
+        else:
+            Print("Enemy {EnemyIndex} was not moving - nothing to pause")
 
     # Runs when a hold ends WITHOUT completing: the player released the key,
     # walked out of range, or something else interrupted it.
     #
-    # Log-only as well, and deliberately so: an abandoned hold must leave the cow
-    # in exactly the state it was in before, which is what "no state was touched
-    # in OnInteractStarted" already guarantees. There is nothing to undo.
+    # An abandoned hold must leave the cow exactly as it was, so this undoes the
+    # one thing OnInteractStarted did - and ONLY if it did it. The latch is the
+    # whole test: no latch, no Play(). A cancel with no matching pause (a cow that
+    # was already still, a second player's cancel after the first already resumed)
+    # therefore does nothing at all.
+    #
+    # The latch is consumed BEFORE Play() rather than after, and unconditionally -
+    # outside the component lookup. Two reasons: a missing movement component must
+    # not leave the latch stuck true, and clearing first means that even if Play()
+    # somehow re-entered this handler, the latch is already spent.
     #
     # NOTE - the digest warns that the base interactable_component "cannot be
     # canceled" and that CanceledEvent exists for subclasses to fire. That is not
@@ -160,24 +234,79 @@ enemy_interaction_handler := class:
     OnInteractCanceled(InAgent : agent) : void =
         Print("Interaction canceled on enemy {EnemyIndex} - hold not completed")
 
-    # Runs when a player finishes interacting with THIS cow.
+        if (DidPauseForHold?):
+            set DidPauseForHold = false
+
+            if:
+                MovementComp := HealthComp.Entity.GetComponent[keyframed_movement_component]
+            then:
+                MovementComp.Play()
+                Print("Enemy {EnemyIndex} resumed walking to the pasture")
+            else:
+                Print("WARNING: enemy {EnemyIndex} was paused for a hold but has no keyframed_movement_component to resume")
+        else:
+            Print("Enemy {EnemyIndex} was not paused by a hold - leaving it as it is")
+
+    # Runs when a player completes the hold on THIS cow. The cow falls ASLEEP: it
+    # stops where it stands, stops being a threat, and its body stays in the world.
     #
     # InAgent is the interacting player - received because the event sends it,
-    # and unused for now: the kill is not yet attributed to anyone.
+    # and unused for now: the sedation is not attributed to anyone.
     #
-    # It only deals damage. Everything else is the existing death pipeline,
-    # untouched and reused: ApplyDamage -> EliminatedEvent ->
-    # WatchEnemyDeath -> RemoveFromParent -> OnEnemyDied -> the live counter and
-    # the wave/run endings. That reuse is why no guard is needed here for a
-    # finished run or a stale wave; OnEnemyDied already owns those checks.
+    # The cow is neutralized through the EXISTING elimination channel, not a new
+    # one: ApplyDamage -> EliminatedEvent -> WatchEnemyDeath -> OnEnemyDied -> the
+    # live counter and the wave/run endings. The only thing that changes anywhere
+    # downstream is that WatchEnemyDeath leaves the body standing instead of
+    # removing it - see there. The counter, its guards and its atomicity are
+    # untouched, which is the whole reason for routing sedation this way: the
+    # `if (CurrentHealth > 0.0)` guard in ApplyDamage already makes "this enemy is
+    # out" fire exactly once per cow, so the counter cannot be told twice. It also
+    # means a sedated cow absorbs nothing from the damage button afterwards - its
+    # health is already 0 - with no special case anywhere.
     #
-    # A huge KillDamage rather than the cow's exact remaining health so that one
-    # interaction is always lethal, whatever the health_component was tuned to
-    # and whatever the damage button already chipped off. (Passing
-    # HealthComp.MaxHealth would also always be lethal, but it re-couples the
-    # kill to a value a designer can lower.)
+    # THE ORDER OF THESE FIVE STEPS IS LOAD-BEARING. Nothing here suspends, so the
+    # whole block is atomic, but each step still has to precede the one after it:
+    #
+    #   1. IsSedated first. ApplyDamage signals EliminatedEvent, and the digest
+    #      does not say whether Signal resumes a waiting task synchronously inside
+    #      the same transaction. Setting the flag first is correct under both
+    #      readings; setting it after the damage would be a race under one of them.
+    #   2. Seal DidPauseForHold before anything can emit a cancel. Step 4 may well
+    #      cancel other agents' in-flight holds on this cow, and each cancel calls
+    #      OnInteractCanceled - which would Play() the movement and send a sleeping
+    #      cow walking to the crop. With the latch already spent, that path is shut.
+    #   3. Pause unconditionally, no IsPlaying[] test. "Sedated implies not moving"
+    #      is an invariant, not an optimisation: normally step 1 of the hold already
+    #      paused it, but with InteractHoldSeconds at 0 the started event may have
+    #      had nothing to pause. Pause() on an already-paused animation is a no-op.
+    #   4. Disable the interactable so the prompt disappears and the cow cannot be
+    #      sedated twice. Belt and braces only - the health guard is what actually
+    #      guarantees single neutralization even if a second success got through.
+    #   5. ApplyDamage last, once the cow's world state is fully settled, because
+    #      this is the step that announces the neutralization to everyone else.
     OnInteractSucceeded(InAgent : agent) : void =
-        Print("Interaction completed on enemy {EnemyIndex} - applying {KillDamage} lethal damage")
+        Print("Interaction completed on enemy {EnemyIndex} - sedating it")
+
+        # 1. Tell the elimination channel this is a sedation, not a kill.
+        set HealthComp.IsSedated = true
+
+        # 2. Shut the resume path before step 4 can trigger any cancel.
+        set DidPauseForHold = false
+
+        # 3. A sleeping cow does not walk. Pause(), never Stop() - Stop would
+        #    teleport the body back to its spawn point.
+        if:
+            MovementComp := HealthComp.Entity.GetComponent[keyframed_movement_component]
+        then:
+            MovementComp.Pause()
+        else:
+            Print("Enemy {EnemyIndex} has no keyframed_movement_component - nothing to stop")
+
+        # 4. No more prompts on this cow. The digest: "Disabled components do not
+        #    provide interaction prompts."
+        InteractableComp.Disable()
+
+        # 5. Neutralize. Everything downstream is the existing pipeline.
         HealthComp.ApplyDamage(KillDamage)
 
 # Wave Manager: entry point for the arena's game flow.
@@ -313,10 +442,53 @@ wave_manager := class(creative_device):
     @editable
     CropMaxHealth : float = 100.0
 
-    # How much crop health one cow destroys by reaching the pasture. At the
-    # defaults, five arrivals wipe the crop out.
+    # How much crop health ONE cow destroys per damage tick while it stands in the
+    # pasture. A cow that arrives keeps eating until it is sedated or killed, so
+    # this is a rate, not a one-off cost.
+    #
+    # This replaces the old CropDamagePerCow, which was deliberately removed
+    # rather than reused: its meaning changed from "cost of one arrival" to "cost
+    # per second", and its 20.0 would have wiped the crop in five seconds under
+    # the new reading. A field whose name no longer matches its meaning is worse
+    # than a field that is gone.
+    #
+    # WHAT MATTERS FOR BALANCE IS THE RATE, CropDamagePerTick / CropDamageInterval.
+    # At the 2.0 / 1.0 defaults that is 2 health per second: one cow alone needs
+    # 50 s to destroy a 100-health crop, five cows need 10 s. That is deliberately
+    # forgiving for a first run - it leaves room to watch the log tick and sedate
+    # the cow mid-count to prove the drain stops. 4.0 / 1.0 is closer to the old
+    # punishment and is the value to try once this is verified.
     @editable
-    CropDamagePerCow : float = 20.0
+    CropDamagePerTick : float = 2.0
+
+    # Seconds between damage ticks from one cow in the pasture.
+    #
+    # Shorter means a smoother drain and more log lines, not a harder game -
+    # halving this while halving CropDamagePerTick leaves the rate unchanged.
+    #
+    # It is also the polling period of the drain loop, so it doubles as the worst
+    # case delay before a stopped cow's loop notices and exits. That delay costs
+    # task lifetime only, never crop health: the guards are re-checked before
+    # every subtraction. See DrainCropWhileAtPasture.
+    @editable
+    CropDamageInterval : float = 1.0
+
+    # TEMPORARY runaway backstop for the drain loop - remove once 5a is verified.
+    #
+    # A periodic loop that fails to exit is the one catastrophic failure mode in
+    # this design: Verse is cooperatively scheduled on a single thread, so a loop
+    # that stops reaching its Sleep would freeze the whole game, not just the cow.
+    # The structure of DrainCropWhileAtPasture is meant to make that impossible,
+    # and this cap is the admission that "meant to" is not "verified to".
+    #
+    # 1000 ticks at the default interval is about 16 minutes of continuous eating
+    # by one cow, so a real game can never reach it. If the warning it prints ever
+    # appears, an exit condition is broken and the log will say so instead of the
+    # editor hanging.
+    #
+    # Not @editable on purpose: it is scaffolding, and scaffolding does not belong
+    # in a designer's Details panel.
+    MaxCropDamageTicks : int = 1000
 
     # Crop health right now. Starts at 0.0 only because a field needs SOME
     # default; the real value is assigned in OnStartPressed - see there for why
@@ -685,10 +857,11 @@ wave_manager := class(creative_device):
             # to be an object rather than a shared callback.
             Handler : enemy_interaction_handler = enemy_interaction_handler:
                 HealthComp := EnemyHealthComp
+                InteractableComp := Interactable
                 KillDamage := InteractKillDamage
                 EnemyIndex := Index
 
-            Handler.Attach(Interactable)
+            Handler.Attach()
 
             Print("Enemy {Index} is now interactable - one interaction deals {InteractKillDamage} damage")
         else:
@@ -1047,61 +1220,155 @@ wave_manager := class(creative_device):
     WatchEnemyArrival(Enemy : entity, MovementComp : keyframed_movement_component, Generation : int)<suspends> : void =
         MovementComp.FinishedEvent.Await()
 
-        # Guard 1: the wave this enemy belonged to must still be the current one.
-        #
-        # Guard 2: the enemy must still be in the scene. GetParent[] is failable
-        # and the digest says it "fails if there is currently no parent entity" -
-        # which is exactly the state RemoveFromParent leaves a dead enemy in. So
-        # this is a direct liveness test, with no coordination with the death
-        # watcher needed.
-        #
-        # That second guard matters because it is NOT documented whether the
-        # engine fires FinishedEvent when an entity is removed mid-animation. If
-        # it does, this check is what stops a corpse from reporting an arrival.
-        # Guard 3: the run must still be going. After either ending, arrivals
-        # stop counting entirely - no crop damage, not even a log line.
-        if:
-            Generation = WaveGeneration
-            Enemy.GetParent[]
-            not RunHasEnded?
-        then:
-            # The cow eats. Max clamps at 0 so the crop never goes negative.
-            #
-            # NO DATA RACE, even with several cows landing in the same instant.
-            # Verse is cooperatively scheduled on one thread: a task runs from
-            # resume to its next suspension point without interruption, and
-            # there is no Await or Sleep between reading CropHealth, writing it
-            # and logging it. Arrivals are therefore processed one after the
-            # other, never interleaved, and no subtraction can be lost.
-            set CropHealth = Max(0.0, CropHealth - CropDamagePerCow)
+        Print("cow reached the pasture - it starts eating the crop")
 
-            Print("cow reached the pasture - crop health: {CropHealth} / {CropMaxHealth}")
+        # Hand over to the drain. A plain call, NOT a new spawn: this task already
+        # exists per cow and has nothing left to wait for, so the eating happens on
+        # the same thread of execution. MovementComp is not needed past this point.
+        #
+        # Every guard that used to sit here now lives inside the loop, because with
+        # continuous damage they have to be re-checked before every subtraction
+        # rather than once on arrival.
+        DrainCropWhileAtPasture(Enemy, Generation)
 
-            # DEFEAT. The `not RunHasEnded?` here is belt and braces: the guard
-            # above already established it, and nothing in between suspends. It
-            # is kept so this block is correct on its own terms if the code above
-            # is ever rearranged.
+    # Drains the crop, one tick every CropDamageInterval, for as long as this ONE
+    # cow is still standing in the pasture and still a threat.
+    #
+    # THE INVARIANT THIS FUNCTION EXISTS TO PROTECT:
+    #   No `set CropHealth` may ever run without the guards having been checked in
+    #   the same suspension-free span.
+    # Sleep is the only suspension point in the loop, and it sits at the very end
+    # of the iteration - so the check, the subtraction and the defeat test are one
+    # uninterrupted block. Verse is cooperatively scheduled on a single thread, so
+    # that contiguity is a guarantee, not a hope.
+    #
+    # THE STRUCTURAL RULE, non-negotiable: every iteration either sleeps or breaks.
+    # The Sleep in the `then` branch is unconditional, and the `else` branch ends
+    # in an unconditional `break`. An `else` that neither slept nor broke would be
+    # a busy loop with no suspension point, which on a single cooperative thread
+    # would freeze the entire game - not just this cow. That is why the shape is
+    # this rigid, and why MaxCropDamageTicks is also in the guard for now.
+    #
+    # WHY `CurrentHealth > 0.0` RATHER THAN `not IsSedated?`: 4b established that
+    # reaching 0 health means "no longer a threat", with dying and falling asleep
+    # as the two ways to get there. So "is this cow still a threat" IS the stop
+    # condition, and health is where it is written. It is a strict superset of the
+    # sedation flag: it catches sedated cows, killed cows, and the window between
+    # Signal firing and WatchEnemyDeath resuming, in which health is already 0 but
+    # no body has been removed yet. One condition instead of two, and it is the
+    # same latch the live counter relies on.
+    #
+    # POLLING LATENCY COSTS TASK LIFETIME, NEVER CROP HEALTH. A cow sedated just
+    # after a tick keeps this task alive for up to one more interval, but when it
+    # wakes the guard fails and it exits without subtracting anything. Maximum
+    # crop damage dealt after a game over is therefore exactly 0.0.
+    #
+    # This also FIXES rather than inherits the parked-watcher leak for the
+    # post-arrival half: a polling loop exits on its own when its cow is
+    # neutralized or swept, where the old one-shot Await could park forever.
+    DrainCropWhileAtPasture(Enemy : entity, Generation : int)<suspends> : void =
+        # Runaway backstop - see MaxCropDamageTicks. Temporary.
+        var TicksRemaining : int = MaxCropDamageTicks
+
+        loop:
             if:
-                CropHealth <= 0.0
+                # Guard 1: the wave this cow belonged to must still be the current
+                # one. Catches a new wave starting and the generation bump the
+                # defeat below performs.
+                Generation = WaveGeneration
+
+                # Guard 2: the run must still be going. After either ending,
+                # eating stops entirely - no damage, not even a log line.
                 not RunHasEnded?
+
+                # Guard 3: the cow must still be in the scene. GetParent[] is
+                # failable and the digest says it "fails if there is currently no
+                # parent entity" - exactly the state RemoveFromParent leaves a
+                # killed cow, or any cow swept by ClearCurrentWave, in. A direct
+                # liveness test needing no coordination with the death watcher.
+                Enemy.GetParent[]
+
+                # Guard 4: the cow must still be a threat. This is the one that
+                # stops a SEDATED cow, which is neutralized but still standing and
+                # therefore still passes guard 3.
+                HealthComp := Enemy.GetComponent[health_component]
+                HealthComp.CurrentHealth > 0.0
+
+                # Guard 5: temporary. See MaxCropDamageTicks.
+                TicksRemaining > 0
             then:
-                # Latch FIRST, before anything else can re-enter.
-                set RunHasEnded = true
-                Print("Game over - the crop was destroyed")
+                # Spend the tick FIRST, so no path through the loop body can skip
+                # the decrement and defeat the backstop.
+                set TicksRemaining -= 1
 
-                # Sweep the surviving cows out of the world, so the end of the
-                # run is unambiguous on screen and the field is clean for the
-                # next Start.
-                ClearCurrentWave()
+                # The cow eats. Max clamps at 0 so the crop never goes negative.
+                #
+                # NO DATA RACE, even with several cows eating on the same interval.
+                # A task runs from resume to its next suspension point without
+                # interruption, and there is no Await or Sleep between reading
+                # CropHealth, writing it and logging it. Ticks are therefore
+                # processed one after another, never interleaved, and no
+                # subtraction can be lost.
+                set CropHealth = Max(0.0, CropHealth - CropDamagePerTick)
 
-                # Defence in depth: bumping the generation invalidates every
-                # stamped thing still in flight in one stroke - death watchers,
-                # other arrival watchers, and any ChainNextWave still sleeping -
-                # without relying on each of them remembering to check the latch.
-                set WaveGeneration += 1
+                Print("cow eating at the pasture - crop health: {CropHealth} / {CropMaxHealth}")
+
+                # DEFEAT - moved in here unchanged from the old arrival handler.
+                # The `not RunHasEnded?` is belt and braces: guard 2 above already
+                # established it and nothing in between suspends. It is kept so
+                # this block stays correct on its own terms.
+                #
+                # SEVERAL COWS CANNOT TRIGGER DEFEAT TWICE, for two independent
+                # reasons: the latch is set before anything else can re-enter, and
+                # the other cows' loops fail guard 2 on their next wake so they
+                # never even reach this test.
+                if:
+                    CropHealth <= 0.0
+                    not RunHasEnded?
+                then:
+                    # Latch FIRST, before anything else can re-enter.
+                    set RunHasEnded = true
+                    Print("Game over - the crop was destroyed")
+
+                    # Sweep the surviving cows out of the world, so the end of the
+                    # run is unambiguous on screen and the field is clean for the
+                    # next Start.
+                    ClearCurrentWave()
+
+                    # Defence in depth: bumping the generation invalidates every
+                    # stamped thing still in flight in one stroke - death watchers,
+                    # other drain loops, and any ChainNextWave still sleeping -
+                    # without relying on each of them remembering to check the
+                    # latch.
+                    #
+                    # Note this also invalidates THIS loop: guards 1, 2 and 3 all
+                    # fail on the next wake, so the loop that caused the defeat
+                    # shuts itself down. No explicit break is added here on
+                    # purpose - one exit mechanism, not two.
+                    set WaveGeneration += 1
+
+                # The only suspension point, unconditional, and last.
+                Sleep(CropDamageInterval)
+            else:
+                # Exactly one exit. The if/else below only chooses what to say; the
+                # break is unconditional.
+                if (TicksRemaining <= 0):
+                    Print("WARNING: crop drain backstop tripped after {MaxCropDamageTicks} ticks - an exit condition is broken")
+                else:
+                    Print("cow stopped eating - crop left at {CropHealth} / {CropMaxHealth}")
+
+                break
 
     # One instance of this task runs per living enemy, parked on Await() until
-    # that specific enemy dies. Launched by the spawn loop via `spawn`.
+    # that specific enemy STOPS BEING A THREAT - by dying, or by being sedated.
+    # Launched by the spawn loop via `spawn`.
+    #
+    # EliminatedEvent means "this enemy is out", not strictly "this enemy died".
+    # Both endings travel this one channel on purpose: ApplyDamage's
+    # `if (CurrentHealth > 0.0)` guard makes it fire at most once per enemy, so
+    # this task resumes at most once and OnEnemyDied is called at most once,
+    # whatever neutralized the cow. That is what keeps the live counter correct
+    # without the counter knowing sedation exists.
     #
     # No cancellation: `task` in /Verse.org/Concurrency exposes only Await(),
     # not Cancel. So if a wave is wiped by ClearCurrentWave instead of being
@@ -1109,14 +1376,28 @@ wave_manager := class(creative_device):
     # this against a wave-ended event, which is a separate step.
     WatchEnemyDeath(HealthComp : health_component, Generation : int)<suspends> : void =
         # Await returns the payload of EliminatedEvent, which is the entity that
-        # died - so we do not need to capture the entity separately.
+        # was neutralized - so we do not need to capture the entity separately.
         DeadEntity : entity = HealthComp.EliminatedEvent.Await()
 
-        # Removing from the world now happens HERE, at the moment of death,
-        # rather than in the damage handler. Any future damage source gets this
-        # behaviour for free.
-        DeadEntity.RemoveFromParent()
+        # THE ONLY PLACE the two endings diverge, and it decides one thing only:
+        # what happens to the body. A sedated cow keeps standing where it fell
+        # asleep; a killed one is removed from the world.
+        #
+        # The flag is guaranteed to be readable here: OnInteractSucceeded sets it
+        # before the ApplyDamage that signals this event, so it is already true
+        # whether Signal resumed us synchronously or later.
+        #
+        # Removing from the world happens HERE, at the moment of neutralization,
+        # rather than in whatever dealt the damage. Any future damage source gets
+        # that behaviour for free.
+        if (HealthComp.IsSedated?):
+            Print("Enemy sedated - it is asleep and no longer a threat, body left standing")
+        else:
+            DeadEntity.RemoveFromParent()
 
+        # Called identically on both paths. The counter, its generation guard, its
+        # run-ended latch and the wave/victory decisions are all unchanged: as far
+        # as they are concerned one more enemy is simply out of the fight.
         OnEnemyDied(Generation)
 
     # Single place where the live count goes down, and the only place that

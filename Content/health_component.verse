@@ -27,6 +27,38 @@ health_component<public> := class<final_super>(component):
     # the real initial value is set in OnBeginSimulation below.
     var CurrentHealth : float = 0.0
 
+    # Marks that this entity reached 0 health by being NEUTRALIZED rather than
+    # killed - in this game, sedated.
+    #
+    # THIS COMPONENT NEVER ACTS ON IT. Nothing below reads it: ApplyDamage behaves
+    # identically either way, and EliminatedEvent fires the same. It is purely a
+    # note left for whoever handles EliminatedEvent, telling them what to do with
+    # the body - remove it, or leave it standing.
+    #
+    # It lives here, rather than in the wave logic, because it has to be readable
+    # from the one place that learns about the elimination, and EliminatedEvent's
+    # listener holds this component and nothing else.
+    #
+    # WHY IT IS A FLAG AND NOT A SECOND EVENT: reaching 0 health means "no longer
+    # a threat", and dying and falling asleep are two ways to stop being one. The
+    # `if (CurrentHealth > 0.0)` guard in ApplyDamage already makes that
+    # transition fire exactly once per entity, whatever caused it. Reusing it
+    # means the wave counter cannot be told twice that the same enemy is out, and
+    # it needs no knowledge of sedation at all. A parallel "sedated" event would
+    # need a second latch and would leave a sedated enemy still killable, which is
+    # exactly how a counter goes out of sync.
+    #
+    # Set it BEFORE the ApplyDamage call that neutralizes the entity. Signal
+    # resumes waiting tasks and the digest does not say whether that happens
+    # synchronously within the same transaction, so the flag must already be true
+    # when the damage lands.
+    # `<public>` like EliminatedEvent and ApplyDamage, and for the same reason:
+    # this is read and written from outside the component. The verified precedents
+    # for writing a `var` field through a reference are `set
+    # HoldDuration.InteractDuration` and `set BasicInteractable.CanInteractMessage`
+    # in wave_manager, both on digest fields declared exactly this shape.
+    var IsSedated<public> : logic = false
+
     # Fired once when this entity's health reaches 0. The payload is the entity
     # that died, so a listener knows WHICH enemy it was.
     #
