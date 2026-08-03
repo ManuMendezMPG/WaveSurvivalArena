@@ -61,10 +61,22 @@ spawn_zone := struct:
 # unverified line in this sub-step. It is also trivially revertible - see the
 # note on ConfigureInteractPrompt.
 #
-# NO KEY NAME IN THE TEXT. "Sedate the cow", not "Hold E to sedate the cow":
-# Fortnite draws the key or the gamepad glyph itself next to this label, so a
-# hardcoded "E" would be wrong on a controller and duplicated on a keyboard.
-SedateCowPrompt<localizes> : message = "Sedate the cow"
+# WHAT THE TEXT HAS TO TEACH. The engine's duration interaction is not a real
+# hold: the player presses once, and the bar then fills only while they stay in
+# range and do not move - moving or being pushed out of range is what cancels it.
+# "Sedate the cow" named the action but taught none of that, leaving the player to
+# discover the cancel rule by failing.
+#
+# "Stay still" rather than "Stay close", even though both are true, because the
+# prompt is only ever on screen when the player is ALREADY in range - proximity is
+# not the news. Standing still is: it is the condition they are about to break,
+# and it implies staying close, so one phrase covers both rules.
+#
+# NO KEY NAME IN THE TEXT, and no "hold": Fortnite draws the key or the gamepad
+# glyph itself next to this label, so a hardcoded "E" would be wrong on a
+# controller and duplicated on a keyboard - and "hold" would describe a keypress
+# the mechanic does not actually require.
+SedateCowPrompt<localizes> : message = "Stay still to sedate"
 
 # One instance of this per living enemy. It exists for exactly one reason: to
 # answer "which cow was that?" when an interaction succeeds.
