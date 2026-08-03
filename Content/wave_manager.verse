@@ -453,18 +453,22 @@ wave_manager := class(creative_device):
     # than a field that is gone.
     #
     # WHAT MATTERS FOR BALANCE IS THE RATE, CropDamagePerTick / CropDamageInterval.
-    # At the 2.0 / 1.0 defaults that is 2 health per second: one cow alone needs
-    # 50 s to destroy a 100-health crop, five cows need 10 s. That is deliberately
-    # forgiving for a first run - it leaves room to watch the log tick and sedate
-    # the cow mid-count to prove the drain stops. 4.0 / 1.0 is closer to the old
-    # punishment and is the value to try once this is verified.
+    # At the 4.0 / 1.0 defaults that is 4 health per second: one cow alone needs
+    # 25 s to destroy a 100-health crop, three cows need about 8 s, five need 5 s.
+    #
+    # This started at 2.0 while the drain loop was being verified, which was
+    # deliberately forgiving. 4.0 is the playable value: it lands close to the old
+    # one-bite-per-arrival punishment - five arrivals used to zero the crop
+    # instantly, and now they take five seconds - so arrivals still hurt but are
+    # recoverable if the player sedates fast. Tune from here by feel.
     @editable
-    CropDamagePerTick : float = 2.0
+    CropDamagePerTick : float = 4.0
 
     # Seconds between damage ticks from one cow in the pasture.
     #
-    # Shorter means a smoother drain and more log lines, not a harder game -
-    # halving this while halving CropDamagePerTick leaves the rate unchanged.
+    # Shorter means a smoother drain, not a harder game - halving this while
+    # halving CropDamagePerTick leaves the rate unchanged. Nothing is logged per
+    # tick any more, so a shorter interval costs no log noise either.
     #
     # It is also the polling period of the drain loop, so it doubles as the worst
     # case delay before a stopped cow's loop notices and exits. That delay costs
@@ -472,23 +476,6 @@ wave_manager := class(creative_device):
     # every subtraction. See DrainCropWhileAtPasture.
     @editable
     CropDamageInterval : float = 1.0
-
-    # TEMPORARY runaway backstop for the drain loop - remove once 5a is verified.
-    #
-    # A periodic loop that fails to exit is the one catastrophic failure mode in
-    # this design: Verse is cooperatively scheduled on a single thread, so a loop
-    # that stops reaching its Sleep would freeze the whole game, not just the cow.
-    # The structure of DrainCropWhileAtPasture is meant to make that impossible,
-    # and this cap is the admission that "meant to" is not "verified to".
-    #
-    # 1000 ticks at the default interval is about 16 minutes of continuous eating
-    # by one cow, so a real game can never reach it. If the warning it prints ever
-    # appears, an exit condition is broken and the log will say so instead of the
-    # editor hanging.
-    #
-    # Not @editable on purpose: it is scaffolding, and scaffolding does not belong
-    # in a designer's Details panel.
-    MaxCropDamageTicks : int = 1000
 
     # Crop health right now. Starts at 0.0 only because a field needs SOME
     # default; the real value is assigned in OnStartPressed - see there for why
@@ -1220,7 +1207,10 @@ wave_manager := class(creative_device):
     WatchEnemyArrival(Enemy : entity, MovementComp : keyframed_movement_component, Generation : int)<suspends> : void =
         MovementComp.FinishedEvent.Await()
 
-        Print("cow reached the pasture - it starts eating the crop")
+        # One of the two log lines that replaced the per-tick spam. It carries the
+        # crop's value AND the rate, so the drain that follows is predictable from
+        # this line alone without printing anything while it runs.
+        Print("cow reached the pasture - it starts eating {CropDamagePerTick} every {CropDamageInterval} s. Crop at {CropHealth} / {CropMaxHealth}")
 
         # Hand over to the drain. A plain call, NOT a new spawn: this task already
         # exists per cow and has nothing left to wait for, so the eating happens on
@@ -1247,7 +1237,9 @@ wave_manager := class(creative_device):
     # in an unconditional `break`. An `else` that neither slept nor broke would be
     # a busy loop with no suspension point, which on a single cooperative thread
     # would freeze the entire game - not just this cow. That is why the shape is
-    # this rigid, and why MaxCropDamageTicks is also in the guard for now.
+    # this rigid. It carried a temporary tick-count backstop through its first
+    # build; that has been removed now the four real guards are verified to stop
+    # the loop in every case (sedation, death, wave end, game over, manual Start).
     #
     # WHY `CurrentHealth > 0.0` RATHER THAN `not IsSedated?`: 4b established that
     # reaching 0 health means "no longer a threat", with dying and falling asleep
@@ -1267,9 +1259,6 @@ wave_manager := class(creative_device):
     # post-arrival half: a polling loop exits on its own when its cow is
     # neutralized or swept, where the old one-shot Await could park forever.
     DrainCropWhileAtPasture(Enemy : entity, Generation : int)<suspends> : void =
-        # Runaway backstop - see MaxCropDamageTicks. Temporary.
-        var TicksRemaining : int = MaxCropDamageTicks
-
         loop:
             if:
                 # Guard 1: the wave this cow belonged to must still be the current
@@ -1293,25 +1282,21 @@ wave_manager := class(creative_device):
                 # therefore still passes guard 3.
                 HealthComp := Enemy.GetComponent[health_component]
                 HealthComp.CurrentHealth > 0.0
-
-                # Guard 5: temporary. See MaxCropDamageTicks.
-                TicksRemaining > 0
             then:
-                # Spend the tick FIRST, so no path through the loop body can skip
-                # the decrement and defeat the backstop.
-                set TicksRemaining -= 1
-
                 # The cow eats. Max clamps at 0 so the crop never goes negative.
                 #
                 # NO DATA RACE, even with several cows eating on the same interval.
                 # A task runs from resume to its next suspension point without
                 # interruption, and there is no Await or Sleep between reading
-                # CropHealth, writing it and logging it. Ticks are therefore
-                # processed one after another, never interleaved, and no
+                # CropHealth, writing it and testing for defeat. Ticks are
+                # therefore processed one after another, never interleaved, and no
                 # subtraction can be lost.
+                #
+                # DELIBERATELY SILENT. Logging here meant one line per second per
+                # cow, which buried everything else in the output. The crop's value
+                # is reported at the two moments that matter instead - when a cow
+                # starts eating and when it stops - plus the game over line.
                 set CropHealth = Max(0.0, CropHealth - CropDamagePerTick)
-
-                Print("cow eating at the pasture - crop health: {CropHealth} / {CropMaxHealth}")
 
                 # DEFEAT - moved in here unchanged from the old arrival handler.
                 # The `not RunHasEnded?` is belt and braces: guard 2 above already
@@ -1350,12 +1335,28 @@ wave_manager := class(creative_device):
                 # The only suspension point, unconditional, and last.
                 Sleep(CropDamageInterval)
             else:
-                # Exactly one exit. The if/else below only chooses what to say; the
-                # break is unconditional.
-                if (TicksRemaining <= 0):
-                    Print("WARNING: crop drain backstop tripped after {MaxCropDamageTicks} ticks - an exit condition is broken")
+                # Exactly one exit. The if/else below only chooses what to SAY; the
+                # break is unconditional and last, exactly as before.
+                #
+                # WORKING OUT THE REASON: a cow that is still parented but has 0
+                # health is precisely a SEDATED one - a killed cow gets
+                # RemoveFromParent, so it cannot pass the first test. That makes
+                # the interesting case exactly identifiable. Everything else -
+                # killed, swept by ClearCurrentWave, wave replaced, run over -
+                # shares one honest message rather than pretending to a precision
+                # these two lookups cannot give.
+                #
+                # This re-tests conditions instead of remembering which guard
+                # failed on purpose: no new state, and the guards above stay
+                # untouched.
+                if:
+                    Enemy.GetParent[]
+                    StoppedHealthComp := Enemy.GetComponent[health_component]
+                    StoppedHealthComp.CurrentHealth <= 0.0
+                then:
+                    Print("cow stopped eating - sedated. Crop left at {CropHealth} / {CropMaxHealth}")
                 else:
-                    Print("cow stopped eating - crop left at {CropHealth} / {CropMaxHealth}")
+                    Print("cow stopped eating - it left the field, or its wave or run ended. Crop left at {CropHealth} / {CropMaxHealth}")
 
                 break
 
