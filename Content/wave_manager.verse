@@ -489,6 +489,21 @@ wave_manager := class(creative_device):
     @editable
     CropDamageInterval : float = 1.0
 
+    # How much of its height a sedated cow keeps. 1.0 is no change; 0.4 leaves it
+    # at 40% of its standing height, which reads as deflated onto the ground.
+    #
+    # A MULTIPLIER, NOT A HEIGHT. It is applied to the scale the cow was SPAWNED
+    # at, so it composes with EnemyScale rather than replacing it - see
+    # ApplySleepFlatten. Only the vertical axis is touched, so the cow keeps its
+    # footprint and its length and stays recognisable as a cow.
+    @editable
+    SleepFlattenFactor : float = 0.4
+
+    # Floor for SleepFlattenFactor. A vertical scale of zero or less does not
+    # flatten a mesh, it collapses or mirrors it, so the editable is clamped
+    # rather than trusted.
+    MinSleepFlattenFactor : float = 0.05
+
     # Crop health right now. Starts at 0.0 only because a field needs SOME
     # default; the real value is assigned in OnStartPressed - see there for why
     # that spot and not StartWave.
@@ -1062,6 +1077,24 @@ wave_manager := class(creative_device):
                     # Remember it so the next enemy of this wave avoids it.
                     set PlacedPositions += array{ SpawnTranslation }
 
+                    # Cache the size this cow was spawned at, so that if it is
+                    # ever sedated the sleep visual can flatten it relative to
+                    # this instead of guessing.
+                    #
+                    # Attached HERE because this is where SpawnScale exists, and
+                    # after AddEntities because a component is added to an entity
+                    # that is already in the scene. The facing rewrite further
+                    # down re-sends the very same SpawnScale, so this stays the
+                    # truth whether or not a pasture is defined.
+                    #
+                    # Purely cosmetic bookkeeping: nothing in the wave, counter,
+                    # damage or movement logic reads this component.
+                    NewSleepVisualComp : sleep_visual_component = sleep_visual_component:
+                        Entity := Enemy
+                        StandingScale := SpawnScale
+
+                    Enemy.AddComponents(array{ NewSleepVisualComp })
+
                     # Give the enemy its health.
                     #
                     # A component must be told its parent entity AT CONSTRUCTION:
@@ -1372,6 +1405,86 @@ wave_manager := class(creative_device):
 
                 break
 
+    # Squashes a sedated cow vertically, so a sleeping body reads as asleep rather
+    # than as a cow that merely stopped walking.
+    #
+    # PURELY COSMETIC AND PURELY ADDITIVE. It reads nothing the game logic owns and
+    # writes nothing the game logic reads - not health, not IsSedated, not the live
+    # counter, not the keyframes, not the crop. Delete this method and its single
+    # call and the game plays exactly as before, just without the tell.
+    #
+    # NOTE ON THE API: there is no SetScale. Scale is not a property of
+    # mesh_component at all - that component exposes only Enable/Disable,
+    # Collidable, Queryable and Visible. Scale lives in the transform, so the only
+    # way to write it is to write a whole transform, which is why the two fields we
+    # are NOT changing have to be carried across by hand below.
+    #
+    # WHY CALLED FROM WatchEnemyDeath AND NOT FROM OnInteractSucceeded: this is the
+    # one place that decides a body stays standing, so it is the one place that
+    # knows a body needs to look asleep. Any future sedation source - a dart, a
+    # trap - gets the visual for free. Same argument as the RemoveFromParent it
+    # sits next to. It also keeps the dial in scope: SleepFlattenFactor lives on
+    # wave_manager, and enemy_interaction_handler would have to be handed it as a
+    # constructor field.
+    #
+    # IT RUNS WITH THE MOVEMENT ALREADY PAUSED, and that is load-bearing rather
+    # than lucky. OnInteractSucceeded pauses the keyframed_movement_component
+    # BEFORE the ApplyDamage that fires the event this hangs off, and a paused
+    # animation stops writing the transform - so the scale written here survives.
+    # The same write applied to a PLAYING animation would be undone on the next
+    # pre-physics tick.
+    ApplySleepFlatten(SleepingEnemy : entity) : void =
+        # The cached spawn scale is the whole point, and it is why nothing here
+        # mentions EnemyScale. The spawn loop wrote Scale as a uniform vector3 of
+        # EnemyScale on all three axes and handed that same vector to
+        # sleep_visual_component; we read it straight back and multiply ONLY its Up
+        # component. The cow ends up at EnemyScale on Left and Forward and at
+        # EnemyScale * SleepFlattenFactor on Up: same footprint, same length,
+        # lower. Retune EnemyScale in the Details panel and this keeps working with
+        # no change here, because the number is never restated.
+        #
+        # Reading the CACHE rather than the cow's current scale also makes this
+        # immune to how keyframed movement treats scale. That component applies
+        # scale ADDITIVELY, which MoveEnemyToPasture already has to defend against
+        # by zeroing the delta's Scale; if that defence ever changed, a
+        # read-modify-write of the live transform would silently flatten the wrong
+        # number. The cache cannot drift that way.
+        if:
+            SleepVisualComp := SleepingEnemy.GetComponent[sleep_visual_component]
+        then:
+            StandingScale : vector3 = SleepVisualComp.StandingScale
+            SafeFlattenFactor : float = Max(MinSleepFlattenFactor, SleepFlattenFactor)
+
+            FlattenedScale : vector3 = vector3:
+                Left := StandingScale.Left
+                Up := StandingScale.Up * SafeFlattenFactor
+                Forward := StandingScale.Forward
+
+            # Translation and Rotation come from the cow's CURRENT transform, not
+            # from the cache: it has to stay exactly where and how it fell asleep.
+            # Only the scale is being replaced.
+            #
+            # Both are written out explicitly because `transform` is a struct - a
+            # field omitted from the literal takes its DEFAULT, not its current
+            # value, so omitting them would teleport the cow to the world origin
+            # and face it north. Same trap the facing write in the spawn loop
+            # documents.
+            CurrentTransform : transform = SleepingEnemy.GetGlobalTransform()
+
+            FlattenedTransform : transform = transform:
+                Translation := CurrentTransform.Translation
+                Rotation := CurrentTransform.Rotation
+                Scale := FlattenedScale
+
+            SleepingEnemy.SetGlobalTransform(FlattenedTransform)
+
+            Print("Sedated cow flattened to {SafeFlattenFactor} of its standing height")
+        else:
+            # Not fatal, and deliberately not compensated for by guessing a scale:
+            # a cow that cannot be flattened should stay the right size rather than
+            # be resized to a number we made up.
+            Print("WARNING: sedated cow has no sleep_visual_component - it will stay standing at full height")
+
     # One instance of this task runs per living enemy, parked on Await() until
     # that specific enemy STOPS BEING A THREAT - by dying, or by being sedated.
     # Launched by the spawn loop via `spawn`.
@@ -1405,6 +1518,10 @@ wave_manager := class(creative_device):
         # that behaviour for free.
         if (HealthComp.IsSedated?):
             Print("Enemy sedated - it is asleep and no longer a threat, body left standing")
+
+            # The body stays, so make it read as asleep rather than as a cow that
+            # merely stopped walking. Cosmetic only - see ApplySleepFlatten.
+            ApplySleepFlatten(DeadEntity)
         else:
             DeadEntity.RemoveFromParent()
 
