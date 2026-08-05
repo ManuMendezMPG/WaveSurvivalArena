@@ -19,7 +19,7 @@ using { /Verse.org/SceneGraph }                     # entity, GetSimulationEntit
 using { /Verse.org/SceneGraph/KeyframedMovement }   # keyframed_movement_component, deltas, easing
 using { /Verse.org/SpatialMath }                    # transform, vector3 (LUF), Distance, DistanceForwardLeft
 using { /Verse.org/Random }                         # GetRandomFloat
-using { /Verse.org/Verse }                          # Min, Max
+using { /Verse.org/Verse }                          # Min, Max, Sin
 using { /UnrealEngine.com/Temporary/Diagnostics }   # Print
 
 # An axis-aligned rectangular area of the world, in Scene Graph LUF
@@ -488,6 +488,42 @@ wave_manager := class(creative_device):
     # every subtraction. See DrainCropWhileAtPasture.
     @editable
     CropDamageInterval : float = 1.0
+
+    # How far a grazing cow swells and shrinks, as a fraction of its own size.
+    # 0.2 means it breathes between 120% and 80% of its spawn scale.
+    #
+    # RELATIVE, NOT ABSOLUTE. It multiplies the scale THAT cow was spawned at, so a
+    # big cow pulses by a big amount and a small one by a small amount, and both
+    # read as the same gesture. 0.0 disables the pulse without removing the code.
+    @editable
+    EatPulseAmount : float = 0.2
+
+    # Seconds for one full swell-and-shrink of a grazing cow. LOWER IS FASTER.
+    #
+    # FULLY INDEPENDENT OF CropDamageInterval. The pulse runs in its own task with
+    # its own Sleep, so the cow can breathe several times per damage tick, and
+    # retuning either rhythm leaves the other alone. Naming follows
+    # CropDamageInterval's convention - seconds, not a speed multiplier - so the two
+    # rhythms are directly comparable when reading the Details panel.
+    @editable
+    EatPulseCycleSeconds : float = 0.5
+
+    # How many scale writes make up one cycle. A code constant, not a dial: it
+    # controls smoothness, not rhythm, and 8 samples of a sine already look smooth.
+    #
+    # It also sets the wake-up rate, at EatPulseCycleSeconds / this seconds apart.
+    # Raising it costs task wake-ups per eating cow for no visible gain.
+    EatPulseSamplesPerCycle : float = 8.0
+
+    # Floor for EatPulseCycleSeconds, which is also what bounds the wake-up rate:
+    # at 0.2 s per cycle over 8 samples the pulse task wakes 40 times a second per
+    # eating cow, and that is as fast as this is allowed to get. It also keeps the
+    # divisions below away from zero.
+    MinEatPulseCycleSeconds : float = 0.2
+
+    # One full turn in radians. Verse has Sin and Cos but ships no Pi constant, so
+    # the period of the wave has to be written out here.
+    TwoPiRadians : float = 6.283185307179586
 
     # How much of its height a sedated cow keeps. 1.0 is no change; 0.4 leaves it
     # at 40% of its standing height, which reads as deflated onto the ground.
@@ -1264,6 +1300,17 @@ wave_manager := class(creative_device):
         # Every guard that used to sit here now lives inside the loop, because with
         # continuous damage they have to be re-checked before every subtraction
         # rather than once on arrival.
+        # Start the cow breathing. A `spawn`, unlike the drain below, precisely
+        # BECAUSE the drain is a plain call that does not return until the cow stops
+        # eating: the two have to run concurrently to keep independent rhythms.
+        #
+        # Launched BEFORE the drain call for that reason - anything written after it
+        # would not run until the eating was already over.
+        #
+        # Cosmetic only. Removing this line removes the pulse and changes nothing
+        # else. See PulseWhileEating.
+        spawn { PulseWhileEating(Enemy, Generation) }
+
         DrainCropWhileAtPasture(Enemy, Generation)
 
     # Drains the crop, one tick every CropDamageInterval, for as long as this ONE
@@ -1402,6 +1449,145 @@ wave_manager := class(creative_device):
                     Print("cow stopped eating - sedated. Crop left at {CropHealth} / {CropMaxHealth}")
                 else:
                     Print("cow stopped eating - it left the field, or its wave or run ended. Crop left at {CropHealth} / {CropMaxHealth}")
+
+                break
+
+    # Makes a grazing cow breathe: a sine swell-and-shrink around the scale it was
+    # spawned at, for as long as it is actually eating.
+    #
+    # ONE TASK PER EATING COW, running alongside DrainCropWhileAtPasture rather than
+    # inside it. That separation is the entire point: the two have unrelated rhythms.
+    # Damage is a balance number tuned in whole seconds; breathing is a cosmetic
+    # gesture that needs several writes per second to not look like a strobe. Sharing
+    # one Sleep welded them together and forced the pulse to the damage cadence.
+    # With its own loop, DrainCropWhileAtPasture is untouched - its Sleep is still
+    # its only suspension point, and the damage rate is still exactly
+    # CropDamagePerTick / CropDamageInterval.
+    #
+    # PURELY COSMETIC AND PURELY ADDITIVE. It reads the guards' state and writes only
+    # the transform's scale. Nothing in the drain, the counter, the waves or the
+    # sedation reads anything this writes. Delete this method and its single spawn and
+    # the game plays identically.
+    #
+    # SAME FOUR GUARDS AS THE DRAIN, deliberately duplicated rather than shared: they
+    # are the definition of "this cow is still eating", and re-testing them here means
+    # this task ends on its own terms without any coordination with the drain. Like
+    # the drain, it is a polling loop, so it self-terminates and adds no parked task
+    # to the leak the death and arrival watchers document.
+    #
+    # EVERY WRITE IS ABSOLUTE, computed from the cached spawn scale and never from the
+    # cow's current scale. That is the invariant that makes three writers of one
+    # transform safe: no write can compound on another, so no sequence of them can
+    # leave a size that is not one of the three known-good values.
+    PulseWhileEating(Enemy : entity, Generation : int)<suspends> : void =
+        # Where in the breath this cow is, in radians. A LOCAL, not a field: one task
+        # runs per cow, so each carries its own phase for free and cows that arrived
+        # at different moments breathe out of sync - a herd, not a chorus line.
+        var PulsePhase : float = 0.0
+
+        # Derived once, outside the loop. Retuning the dial mid-run therefore only
+        # affects cows that start eating afterwards, which is the right trade: a cow
+        # already breathing keeps a steady rhythm instead of lurching.
+        SafeCycleSeconds : float = Max(MinEatPulseCycleSeconds, EatPulseCycleSeconds)
+        PhaseStepRadians : float = TwoPiRadians / EatPulseSamplesPerCycle
+        StepSeconds : float = SafeCycleSeconds / EatPulseSamplesPerCycle
+
+        loop:
+            if:
+                # Guards 1-4 are the drain's, verbatim and in the same order.
+                Generation = WaveGeneration
+                not RunHasEnded?
+                Enemy.GetParent[]
+                HealthComp := Enemy.GetComponent[health_component]
+                HealthComp.CurrentHealth > 0.0
+
+                # Guard 5 is this task's own: without the cached spawn scale there is
+                # no baseline to pulse around, and guessing one is how a cow ends up
+                # the wrong size.
+                SleepVisualComp := Enemy.GetComponent[sleep_visual_component]
+            then:
+                StandingScale : vector3 = SleepVisualComp.StandingScale
+
+                # A sine, not the square wave this had while it lived in the drain
+                # loop. At one write per second a square read as a slow throb, which
+                # was fine; at eight writes per cycle it would read as a strobe.
+                PulseFactor : float = 1.0 + EatPulseAmount * Sin(PulsePhase)
+
+                # Uniform on all three axes. The sedated flatten is vertical-only, so
+                # keeping this uniform means the two states never speak the same
+                # visual language and cannot be mistaken for one another.
+                PulsedScale : vector3 = vector3:
+                    Left := StandingScale.Left * PulseFactor
+                    Up := StandingScale.Up * PulseFactor
+                    Forward := StandingScale.Forward * PulseFactor
+
+                # Translation and Rotation carried across from the live transform: the
+                # cow must not move or turn. Written out explicitly because a field
+                # omitted from a `transform` literal takes its DEFAULT, not its
+                # current value.
+                CurrentTransform : transform = Enemy.GetGlobalTransform()
+
+                PulsedTransform : transform = transform:
+                    Translation := CurrentTransform.Translation
+                    Rotation := CurrentTransform.Rotation
+                    Scale := PulsedScale
+
+                Enemy.SetGlobalTransform(PulsedTransform)
+
+                # Wrapped rather than left to grow forever, so the argument to Sin
+                # stays in a range where its precision is not worth thinking about.
+                set PulsePhase += PhaseStepRadians
+                if (PulsePhase > TwoPiRadians):
+                    set PulsePhase -= TwoPiRadians
+
+                # The only suspension point, unconditional, and last - same shape as
+                # the drain loop, and the line that makes this rhythm independent.
+                Sleep(StepSeconds)
+            else:
+                # Exactly one exit, and the break is unconditional and last.
+                #
+                # UNDO THE PULSE: a single absolute write back to the cached spawn
+                # scale, so a cow can never be left frozen mid-breath. Not
+                # interpolated - there is no "part of the way back" that looks better
+                # than simply being the right size.
+                #
+                # SEDATION WINS, AND THIS IS WHERE THAT IS ENFORCED. IsSedated is set
+                # by OnInteractSucceeded BEFORE the ApplyDamage that brings health to
+                # 0, so by the time this loop wakes and fails guard 4 the flag is
+                # already readable and true. Reading the flag the sedation path
+                # already sets is why the flatten needed no new state and no change.
+                #
+                # WHY THE FLAG RATHER THAN HEALTH: health reaches 0 for killed cows
+                # too, and those DO want their scale put back - harmlessly, since they
+                # are detached a moment later. The flag is what distinguishes asleep
+                # from dead, which is exactly the distinction the restore needs.
+                #
+                # THE RESULT IS ORDER-INDEPENDENT. If this task wrote last,
+                # ApplySleepFlatten overwrites it absolutely from the same cache and
+                # the cow ends up flattened. If the flatten wrote first, this block
+                # skips and the cow stays flattened. Neither order can leave a
+                # breathing-and-flattened hybrid, because no write is ever relative to
+                # the current scale.
+                #
+                # GetParent[] guards the pointless case: a cow already swept out of the
+                # world has no scale worth correcting.
+                #
+                # SILENT. The drain already logs when a cow stops eating; a second
+                # line per cow would be noise.
+                if:
+                    Enemy.GetParent[]
+                    RestoredHealthComp := Enemy.GetComponent[health_component]
+                    not RestoredHealthComp.IsSedated?
+                    RestoreVisualComp := Enemy.GetComponent[sleep_visual_component]
+                then:
+                    RestoredTransform : transform = Enemy.GetGlobalTransform()
+
+                    CleanTransform : transform = transform:
+                        Translation := RestoredTransform.Translation
+                        Rotation := RestoredTransform.Rotation
+                        Scale := RestoreVisualComp.StandingScale
+
+                    Enemy.SetGlobalTransform(CleanTransform)
 
                 break
 
