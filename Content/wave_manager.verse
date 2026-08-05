@@ -2,6 +2,7 @@
 # Each device/type/function lives in a module, and you must import
 # the module before you can reference its names.
 using { /Fortnite.com/Devices }                     # button_device, creative_device
+using { /Fortnite.com/Characters }                  # fort_character, GetFortCharacter
 using { /Verse.org/Simulation }                     # agent (a player/AI actor)
 using { /Verse.org/SceneGraph }                     # entity, GetSimulationEntity, AddEntities
 # CAREFUL: two incompatible SpatialMath modules exist in UEFN.
@@ -342,6 +343,16 @@ wave_manager := class(creative_device):
     @editable
     DamageButton : button_device = button_device{}
 
+    # Third button: the UFO area attack. Every press eliminates every cow within
+    # UfoRadius of the player who pressed it.
+    #
+    # A button for now, and it will not stay one: a button is a fixed object in the
+    # world, so you cannot stand where you want the attack to land AND reach it.
+    # That is fine while the area is centred on the player, and it is the reason
+    # aiming is a later sub-step rather than part of this one.
+    @editable
+    UfoButton : button_device = button_device{}
+
     # The spawn area, defined by two props dropped at OPPOSITE CORNERS of the
     # rectangle. Drag them to the corners of the room you want covered and the
     # zone is sized visually, with no numbers to guess.
@@ -489,6 +500,27 @@ wave_manager := class(creative_device):
     @editable
     CropDamageInterval : float = 1.0
 
+    # Radius of the UFO attack, in centimeters, measured from the pressing player.
+    #
+    # 800 cm is 8 metres, which is a couple of cow-lengths in each direction - big
+    # enough to be worth using, small enough that it does not clear the field. This
+    # is the one number worth tuning by eye first.
+    #
+    # It means centimeters unconditionally: OnUfoPressed forces the query
+    # transform's scale to 1 rather than inheriting the player's, so this radius is
+    # never silently multiplied by something else.
+    @editable
+    UfoRadius : float = 800.0
+
+    # Damage dealt to each cow caught in the attack. A code constant, not a dial,
+    # and deliberately NOT a reuse of InteractKillDamage: that one is named for the
+    # sedation interaction, and two abilities sharing one number is how a later
+    # "make the UFO do partial damage" change accidentally reballances sedation.
+    #
+    # Same reasoning as InteractKillDamage for the size, though: far above any sane
+    # MaxHealth, so the attack is lethal however health gets tuned later.
+    UfoKillDamage : float = 100000.0
+
     # How far a grazing cow swells and shrinks, as a fraction of its own size.
     # 0.2 means it breathes between 120% and 80% of its spawn scale.
     #
@@ -608,6 +640,7 @@ wave_manager := class(creative_device):
         # fires and calls OnStartPressed, passing along the interacting agent.
         StartButton.InteractedWithEvent.Subscribe(OnStartPressed)
         DamageButton.InteractedWithEvent.Subscribe(OnDamagePressed)
+        UfoButton.InteractedWithEvent.Subscribe(OnUfoPressed)
 
     # Removes the enemies of the previous wave from the world and forgets them.
     #
@@ -1270,6 +1303,91 @@ wave_manager := class(creative_device):
                 Print("WARNING: a tracked enemy has no health_component - cannot damage it")
 
         Print("Damage pass done - {LiveEnemyCount} still alive")
+
+    # The UFO area attack: eliminates every cow within UfoRadius of the pressing
+    # player. Step 1 of the special - no aiming, no cooldown, no visuals.
+    #
+    # IT ADDS NO DEATH PATH OF ITS OWN. It ends with the same ApplyDamage every other
+    # damage source uses, so EliminatedEvent, WatchEnemyDeath, RemoveFromParent, the
+    # live counter and the wave/victory decisions all handle these cows without
+    # knowing the UFO exists. Nothing here is coordinated with any of them.
+    #
+    # THE AREA QUERY IS THE EXAMPLE'S, almost verbatim: the shape of
+    # FindOverlapHitsExampleComponent.PerformOverlapCheck, with the example's
+    # collision_capsule swapped for a collision_sphere. The capsule was dimensioned
+    # for a narrow beam hanging under the ship; an area attack wants a ball.
+    #
+    # WHY THE SIMULATION ENTITY IS THE QUERY CONTEXT: the digest says of this
+    # overload that the entity "defines the context (scene) for the query but does
+    # not otherwise take part in the sweep" - it is a handle to the scene, not a
+    # participant, and the area is defined entirely by the transform and the volume.
+    # The simulation entity is the one scene handle a creative_device has, and it is
+    # the same one StartWave already uses.
+    #
+    # LIKE THE DAMAGE BUTTON, THIS IS NOT GATED BY RunHasEnded. Pressing it after a
+    # run ends is harmless - every cow is already gone, so the query finds nothing -
+    # but it still logs, and it inherits that known limitation rather than fixing it
+    # here.
+    OnUfoPressed(InAgent : agent) : void =
+        if:
+            # The pressing player's body. GetFortCharacter is failable - the digest
+            # says it "fails if InAgent is not a fort_character" - so a press from
+            # anything that is not a live player simply does nothing.
+            Character := InAgent.GetFortCharacter[]
+
+            SimulationEntity := GetSimulationEntity[]
+        then:
+            # Built FROM the character's own transform rather than from scratch,
+            # which is what the example does too. A `transform` literal given only a
+            # Translation would take the DEFAULT for Scale - a zero vector - and it
+            # is not documented whether that would collapse the query volume. Taking
+            # a known-good transform and overwriting what we mean to change avoids
+            # having to find out.
+            #
+            # fort_character inherits `positional`, so GetGlobalTransform() hands
+            # back LUF directly. This is the whole reason the un-aimed version is the
+            # safe first step: there is no classic-to-LUF conversion anywhere in it.
+            var QueryTransform : transform = Character.GetGlobalTransform()
+
+            # Scale forced to unit so UfoRadius means centimeters and nothing else.
+            # Inheriting the player's scale would silently multiply the radius.
+            set QueryTransform.Scale = vector3{ Left := 1.0, Up := 1.0, Forward := 1.0 }
+
+            QuerySphere : collision_sphere = collision_sphere{ Radius := UfoRadius }
+
+            # Counted separately on purpose, because the two numbers fail in
+            # different ways. TotalHits counts EVERYTHING the query returned -
+            # ground, props, the lot. CowsHit counts what survived the cast.
+            #
+            # That distinction is the diagnostic: cows but no hits means the area is
+            # empty or too small, while ZERO hits of any kind points at the query
+            # itself - a Queryable flag turned off, or a radius of nothing.
+            var TotalHits : int = 0
+            var CowsHit : int = 0
+
+            for (Overlap : SimulationEntity.FindOverlapHits(QueryTransform, QuerySphere)):
+                set TotalHits += 1
+
+                # The cast IS the filter, exactly as in the example: SM_Toy_Cow is the
+                # generated class for the cow's mesh component, so a component that
+                # casts to it belongs to a cow and nothing else. `.Entity` then walks
+                # back from the component to the cow itself.
+                #
+                # THE SAME COW CAN COME BACK MORE THAN ONCE - one hit per overlapping
+                # volume - and that needs no handling here. ApplyDamage's
+                # `CurrentHealth > 0.0` guard makes the second hit a no-op and stops
+                # EliminatedEvent firing twice, which is the same guard that already
+                # protects the damage button walking a list full of corpses.
+                if:
+                    CowMesh := Meshes.SM_Toy_Cow[Overlap.TargetComponent]
+                    HealthComp := CowMesh.Entity.GetComponent[health_component]
+                then:
+                    set CowsHit += 1
+                    HealthComp.ApplyDamage(UfoKillDamage)
+
+            Print("UFO attack - {CowsHit} cows abducted within {UfoRadius} cm ({TotalHits} total overlaps, {LiveEnemyCount} enemies still alive)")
+        else:
+            Print("WARNING: UFO attack could not run - the presser has no fort_character, or there is no simulation entity")
 
     # One instance of this task runs per walking enemy, parked until that
     # enemy's journey to the pasture ends. Launched by MoveEnemyToPasture.
