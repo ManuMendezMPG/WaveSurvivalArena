@@ -521,6 +521,15 @@ wave_manager := class(creative_device):
     # MaxHealth, so the attack is lethal however health gets tuned later.
     UfoKillDamage : float = 100000.0
 
+    # Seconds between UFO attacks. The cost of the ability: without it the button
+    # can be spammed and the whole field clears for free.
+    #
+    # 8 s is a starting guess, not a tuned value - it wants to be long enough that
+    # sedating by hand stays the bread and butter and the UFO is the answer to a
+    # cluster you cannot reach in time. Tune against how fast a wave arrives.
+    @editable
+    UfoCooldownSeconds : float = 8.0
+
     # How far a grazing cow swells and shrinks, as a fraction of its own size.
     # 0.2 means it breathes between 120% and 80% of its spawn scale.
     #
@@ -596,6 +605,31 @@ wave_manager := class(creative_device):
     # do you belong to", which cannot express "the run is over" - a fresh
     # generation is exactly what a new wave looks like.
     var RunHasEnded : logic = false
+
+    # Simulation time at which the UFO attack becomes usable again. THE WHOLE
+    # COOLDOWN, in one number.
+    #
+    # A DEADLINE, NOT A COUNTDOWN, and that distinction is what removes a whole class
+    # of bug rather than guarding against it. Nothing has to tick it down and nothing
+    # has to be woken up to clear it: "is the UFO ready" is answered by comparing the
+    # clock against this, so the answer is always computed from scratch and can never
+    # be stale. Simulation time only ever increases, so a value in the past means
+    # ready, forever, with no maintenance.
+    #
+    # It replaces a latch plus a start-stamp plus a spawned task that slept and
+    # lowered the latch. That version worked but had a real hole: a task from a
+    # previous run could wake mid-way through a NEW cooldown and clear it early,
+    # which needed a re-check to patch. There is no task here to wake late, so the
+    # hole does not exist to be patched.
+    #
+    # ONLY TWO WRITERS, both synchronous: TryUfoAttack sets it forward when an attack
+    # actually happens, and OnStartPressed sets it to 0.0 to hand the ability back at
+    # the start of a run. Nothing writes it from a suspended context.
+    #
+    # GLOBAL, NOT PER PLAYER - a prototype decision rather than a design one. This is
+    # single-player for now, so a map keyed by player would be state to maintain for a
+    # case that cannot arise yet. It is the one thing here that multiplayer changes.
+    var UfoReadyAt : float = 0.0
 
     # EVERYTHING spawned in the current wave, alive or dead. This is NOT the
     # live-enemy list: dead enemies stay in here until the whole wave is
@@ -704,6 +738,17 @@ wave_manager := class(creative_device):
         # the previous run finished - and the generation bump inside it
         # invalidates anything still in flight from it.
         set RunHasEnded = false
+
+        # Hand the UFO back, so a cooldown left over from the previous run does not
+        # eat into the new one. Run-scoped, like the crop above and for the same
+        # reason: "pressing Start always begins a clean run" is a promise this file
+        # makes elsewhere, and an ability the player cannot use for the first few
+        # seconds would quietly break it.
+        #
+        # 0.0 rather than "now" because simulation time only grows: a deadline in the
+        # past means ready and stays meaning ready. And unlike the latch-plus-task
+        # version this replaced, there is nothing in flight that could undo it.
+        set UfoReadyAt = 0.0
 
         StartWave(1)
 
@@ -1305,7 +1350,7 @@ wave_manager := class(creative_device):
         Print("Damage pass done - {LiveEnemyCount} still alive")
 
     # The UFO area attack: eliminates every cow within UfoRadius of the pressing
-    # player. Step 1 of the special - no aiming, no cooldown, no visuals.
+    # player, at most once every UfoCooldownSeconds. No aiming and no visuals yet.
     #
     # IT ADDS NO DEATH PATH OF ITS OWN. It ends with the same ApplyDamage every other
     # damage source uses, so EliminatedEvent, WatchEnemyDeath, RemoveFromParent, the
@@ -1328,7 +1373,30 @@ wave_manager := class(creative_device):
     # run ends is harmless - every cow is already gone, so the query finds nothing -
     # but it still logs, and it inherits that known limitation rather than fixing it
     # here.
+    #
+    # THE COOLDOWN IS A GATE IN FRONT OF THE ATTACK, not a change to it. The refusal
+    # branch is new; everything under `TryUfoAttack` is the previous version of this
+    # handler, extracted whole so that adding the gate needed no re-indentation of
+    # working code and no second level of nesting in one function.
     OnUfoPressed(InAgent : agent) : void =
+        Now : float = GetSimulationElapsedTime()
+
+        if (Now < UfoReadyAt):
+            # The remaining time IS the state - a subtraction, not a stored value, so
+            # it cannot disagree with whether the gate is closed. No Max clamp needed
+            # either: this branch only runs when the difference is already positive.
+            Print("UFO on cooldown - {UfoReadyAt - Now} s left")
+        else:
+            TryUfoAttack(InAgent)
+
+    # The attack itself, unchanged from step 1. Split out of OnUfoPressed only so the
+    # cooldown gate could go in front of it without touching any of this.
+    #
+    # IT ARMS THE COOLDOWN ITSELF, at the bottom of the `then` branch, and that
+    # placement is the point: the cooldown starts only if the attack ACTUALLY RAN. A
+    # press that cannot resolve a fort_character did nothing, so charging it a
+    # cooldown would punish the player for an engine hiccup.
+    TryUfoAttack(InAgent : agent) : void =
         if:
             # The pressing player's body. GetFortCharacter is failable - the digest
             # says it "fails if InAgent is not a fort_character" - so a press from
@@ -1386,6 +1454,14 @@ wave_manager := class(creative_device):
                     HealthComp.ApplyDamage(UfoKillDamage)
 
             Print("UFO attack - {CowsHit} cows abducted within {UfoRadius} cm ({TotalHits} total overlaps, {LiveEnemyCount} enemies still alive)")
+
+            # Arm the cooldown: one assignment, no task, nothing to clean up later.
+            #
+            # The clock is read fresh rather than passed down from OnUfoPressed. There
+            # is no suspension point between the two reads, so it is the same instant
+            # either way, and reading it here keeps this function's cooldown behaviour
+            # self-contained instead of depending on a value its caller measured.
+            set UfoReadyAt = GetSimulationElapsedTime() + UfoCooldownSeconds
         else:
             Print("WARNING: UFO attack could not run - the presser has no fort_character, or there is no simulation entity")
 
