@@ -530,6 +530,42 @@ wave_manager := class(creative_device):
     @editable
     UfoCooldownSeconds : float = 8.0
 
+    # How high above the target the UFO hovers, in centimeters.
+    #
+    # 600 cm is roughly two storeys - high enough to read as "a ship above you"
+    # rather than a prop in your face, low enough to stay on screen while you are
+    # looking at the ground. Tune with the camera, not with a ruler.
+    @editable
+    UfoHoverHeightCm : float = 600.0
+
+    # Uniform size multiplier for the spawned UFO: 1.0 is the prefab's authored size,
+    # 2.0 is double. Same meaning and same shape as EnemyScale, so the two read the
+    # same way in the Details panel.
+    #
+    # Applied to all three axes, so the ship only gets bigger or smaller and never
+    # deforms.
+    #
+    # It replaces the prefab's authored scale rather than multiplying it, because
+    # SetGlobalTransform writes an absolute transform - exactly as EnemyScale does for
+    # cows. That is only "the authored size" at 1.0 if the prefab was authored at
+    # scale 1, which is the same assumption the cow path already makes.
+    @editable
+    UfoScale : float = 2.0
+
+    # How long the cows take to rise into the ship, in seconds.
+    #
+    # Unused in this sub-step - nothing rises yet - and defined now because it is
+    # half of how long the UFO stays on screen, and because the rise animation and
+    # the wait for it have to be derived from ONE number or the ship will leave
+    # before the cows arrive.
+    @editable
+    UfoRiseSeconds : float = 2.0
+
+    # Extra seconds the UFO stays after the rise finishes, so the beam does not cut
+    # out on the same frame the last cow disappears. Purely for feel.
+    @editable
+    UfoBeamLingerSeconds : float = 0.5
+
     # How far a grazing cow swells and shrinks, as a fraction of its own size.
     # 0.2 means it breathes between 120% and 80% of its spawn scale.
     #
@@ -1455,15 +1491,118 @@ wave_manager := class(creative_device):
 
             Print("UFO attack - {CowsHit} cows abducted within {UfoRadius} cm ({TotalHits} total overlaps, {LiveEnemyCount} enemies still alive)")
 
+            # Send the ship in. PURELY PRESENTATION IN THIS SUB-STEP: the cows above
+            # are already dead by the time this runs, so the UFO is a flourish over an
+            # empty stage. Sub-step 3 is what moves the killing into the choreography.
+            #
+            # The hover point is the query's own transform lifted straight up, so the
+            # ship is always exactly above whatever the attack hit. Copied into a new
+            # var rather than mutating QueryTransform, which the query above still
+            # owns - and written as a full assignment rather than `+=` because that is
+            # the form the example proves for a nested struct field.
+            var HoverTransform : transform = QueryTransform
+            set HoverTransform.Translation.Up = HoverTransform.Translation.Up + UfoHoverHeightCm
+
+            # The ship's own size, overwriting the unit scale inherited from
+            # QueryTransform. Safe to change here BECAUSE this is a copy: the query
+            # above already ran against QueryTransform's unit scale, so UfoRadius still
+            # means centimeters and nothing about the area changed.
+            set HoverTransform.Scale = vector3{ Left := UfoScale, Up := UfoScale, Forward := UfoScale }
+
+            # WaveGeneration is captured NOW, by value, so the task carries the wave it
+            # belongs to. Unused in this sub-step beyond its log line; it is here so
+            # sub-step 3 can add the "is my wave still current" guard without changing
+            # this signature or this call.
+            spawn { RunUfoAbduction(HoverTransform, WaveGeneration) }
+
             # Arm the cooldown: one assignment, no task, nothing to clean up later.
             #
             # The clock is read fresh rather than passed down from OnUfoPressed. There
             # is no suspension point between the two reads, so it is the same instant
             # either way, and reading it here keeps this function's cooldown behaviour
             # self-contained instead of depending on a value its caller measured.
+            #
+            # KEEP UfoCooldownSeconds >= UfoRiseSeconds + UfoBeamLingerSeconds, or a
+            # second press can put a second ship in the sky while the first is still
+            # there. Not enforced in code on purpose: UfoReadyAt is already the gate,
+            # and a second latch for the same job would be duplicated state.
             set UfoReadyAt = GetSimulationElapsedTime() + UfoCooldownSeconds
         else:
             Print("WARNING: UFO attack could not run - the presser has no fort_character, or there is no simulation entity")
+
+    # Puts a UFO in the sky over the target, holds it there, and takes it away again.
+    #
+    # SUB-STEP 1 OF THE CHOREOGRAPHY, and deliberately hollow: no beam, no cows, no
+    # damage. Everything that kills still happens instantly in TryUfoAttack. This
+    # exists to answer two questions before anything is built on top of it - does the
+    # ship appear where we asked, and does it leave again - because both of those are
+    # cheap to check now and expensive to debug later underneath a beam.
+    #
+    # LINEAR, WITH THE CLEANUP ON THE FALL-THROUGH PATH. There is no `break` and no
+    # early exit between the ship existing and RemoveFromParent, and there must never
+    # be one: this SDK has no cancellation and Verse has no `finally`, so the only
+    # thing guaranteeing the sky gets emptied is that every path reaches the last
+    # line. A guard added later must skip WORK, never skip the ending.
+    #
+    # The one `if` that does wrap the ending is the simulation-entity lookup, and that
+    # is not the same hazard: if it fails, no ship was ever created, so there is
+    # nothing left behind to clean up.
+    RunUfoAbduction(HoverTransform : transform, Generation : int)<suspends> : void =
+        if:
+            SimulationEntity := GetSimulationEntity[]
+        then:
+            # Same three-line spawn the wave loop uses for cows: instantiate the
+            # prefab, put it in the world, then place it. AddEntities has to come
+            # first - until then the prefab exists but its components are not in the
+            # scene.
+            UfoEntity : entity = Prefabs.P_UFO{}
+            SimulationEntity.AddEntities(array{ UfoEntity })
+            UfoEntity.SetGlobalTransform(HoverTransform)
+
+            # DISARM THE PATROL THE PREFAB BROUGHT WITH IT.
+            #
+            # P_UFO ships with a simple_movement_component, whose OnBeginSimulation
+            # (SimpleMovementComponent.verse:24-33) calls SetKeyframes with the
+            # prefab's authored keyframes in Loop mode, and whose AutoPlay defaults to
+            # true. So this entity configured itself a flight path the instant
+            # AddEntities put it in the scene, and it did so BEFORE the line above
+            # placed it - SetKeyframes rebases on the current transform, so that path
+            # is anchored to wherever the prefab's default position was.
+            #
+            # It probably would not play: the Play() call hangs off
+            # FortRoundManager.SubscribeRoundStarted, and a ship spawned mid-round
+            # never receives RoundStarted. "Probably" is not a guarantee, so Pause()
+            # makes it certain.
+            #
+            # PAUSE AND NOT STOP. Stop() is documented as resetting the transform to
+            # the initial state, which here means throwing the ship back to wherever
+            # the prefab was authored - the same trap the sedation path documents for
+            # cows. Pause() freezes without moving anything.
+            #
+            # Both branches fall through: a prefab with no movement component is
+            # nothing to fix, it just means there was never a patrol to disarm.
+            if:
+                UfoMovementComp := UfoEntity.GetComponent[keyframed_movement_component]
+            then:
+                UfoMovementComp.Pause()
+                Print("UFO patrol paused - the ship should now hold still")
+            else:
+                Print("UFO has no keyframed_movement_component - nothing to disarm")
+
+            Print("UFO arrived {UfoHoverHeightCm} cm above the target (wave generation {Generation})")
+
+            # One wait for the whole visit, derived from the two dials so the ship's
+            # time on screen and the cows' rise cannot drift apart once sub-step 3
+            # gives the cows something to do.
+            Sleep(UfoRiseSeconds + UfoBeamLingerSeconds)
+
+            # The ending. Unconditional, last, and the reason this whole function is
+            # shaped the way it is. Removing the parent cascades, so the meshes, the
+            # beam, the light and the sounds all go with it in one call.
+            UfoEntity.RemoveFromParent()
+            Print("UFO left")
+        else:
+            Print("WARNING: no simulation entity available - cannot spawn the UFO")
 
     # One instance of this task runs per walking enemy, parked until that
     # enemy's journey to the pasture ends. Launched by MoveEnemyToPasture.
