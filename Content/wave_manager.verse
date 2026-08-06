@@ -1589,12 +1589,31 @@ wave_manager := class(creative_device):
             else:
                 Print("UFO has no keyframed_movement_component - nothing to disarm")
 
+            # KNOWN STATE FIRST. The prefab's authored Enabled flags are not visible
+            # from the digest, so whether it arrives with the beam already lit is a
+            # coin toss. Turning it off before turning it on means the sequence below
+            # does not depend on the answer.
+            #
+            # It buys something real on the sound as well as being documentation: the
+            # beam sound may be on AutoPlay, and Stop-then-Play starts it cleanly
+            # instead of calling Play on an already-playing source.
+            DisableAbductionBeam(UfoEntity)
+            EnableAbductionBeam(UfoEntity)
+
             Print("UFO arrived {UfoHoverHeightCm} cm above the target (wave generation {Generation})")
 
             # One wait for the whole visit, derived from the two dials so the ship's
             # time on screen and the cows' rise cannot drift apart once sub-step 3
             # gives the cows something to do.
             Sleep(UfoRiseSeconds + UfoBeamLingerSeconds)
+
+            # Beam off before the ship goes. Strictly speaking redundant - the
+            # RemoveFromParent below cascades and destroys these components anyway -
+            # and kept for two reasons: it stops the beam sound cleanly instead of
+            # having it cut off mid-sample by destruction, and it is the hook a later
+            # sub-step needs if the beam should ever switch off BEFORE the ship leaves
+            # rather than with it.
+            DisableAbductionBeam(UfoEntity)
 
             # The ending. Unconditional, last, and the reason this whole function is
             # shaped the way it is. Removing the parent cascades, so the meshes, the
@@ -1603,6 +1622,60 @@ wave_manager := class(creative_device):
             Print("UFO left")
         else:
             Print("WARNING: no simulation entity available - cannot spawn the UFO")
+
+    # Lights the abduction beam on a spawned UFO: the beam mesh, the spot light and
+    # the beam sound.
+    #
+    # ADAPTED FROM THE EXAMPLE, one change only. In
+    # FindOverlapHitsExampleComponent.EnableAbductionBeam these are methods on a
+    # component, so they walk the component's own implicit `Entity`. wave_manager is a
+    # creative_device and has no `Entity`, so the ship comes in as a parameter. The
+    # bodies are otherwise the example's.
+    #
+    # WHY FindDescendantComponents AND NOT GetComponent: these components do not live
+    # on the prefab's root entity. P_UFO owns child entities - AbductionBeamMesh,
+    # AbductionLight and the two sound components are spread across them - and this
+    # call walks the whole subtree "to and including InEntity" per the digest.
+    #
+    # THE COUNTS ARE THE DIAGNOSTIC. Three separate lookups can fail independently,
+    # and a silent zero would look exactly like a beam that is on but invisible. If the
+    # log says 0 for one of the three, that lookup is the problem and not the artwork.
+    EnableAbductionBeam(UfoEntity : entity) : void =
+        var BeamMeshCount : int = 0
+        var BeamLightCount : int = 0
+        var BeamSoundCount : int = 0
+
+        for (BeamMesh : UfoEntity.FindDescendantComponents(Meshes.S_EV_SimpleLightBeam_01)):
+            BeamMesh.Enable()
+            set BeamMeshCount += 1
+
+        # Every spot light in the hierarchy, which is the one the example targets too.
+        # P_UFO carries exactly one, AbductionLight - if a second is ever added to the
+        # prefab this would light that as well.
+        for (BeamLight : UfoEntity.FindDescendantComponents(spot_light_component)):
+            BeamLight.Enable()
+            set BeamLightCount += 1
+
+        # Play, not Enable: sound_component's Play is what starts the asset. Targeting
+        # MSS_Ship_Beam specifically leaves MSS_Ship_Hover_Loop alone, so the ship's
+        # engine hum is not touched by the beam going on and off.
+        for (BeamSound : UfoEntity.FindDescendantComponents(Sounds.MSS_Ship_Beam)):
+            BeamSound.Play()
+            set BeamSoundCount += 1
+
+        Print("Abduction beam ON - {BeamMeshCount} beam mesh, {BeamLightCount} spot light, {BeamSoundCount} sound")
+
+    # The mirror of EnableAbductionBeam. Silent on purpose: it is called twice per
+    # visit and the counts it would report are the same ones Enable already logged.
+    DisableAbductionBeam(UfoEntity : entity) : void =
+        for (BeamMesh : UfoEntity.FindDescendantComponents(Meshes.S_EV_SimpleLightBeam_01)):
+            BeamMesh.Disable()
+
+        for (BeamLight : UfoEntity.FindDescendantComponents(spot_light_component)):
+            BeamLight.Disable()
+
+        for (BeamSound : UfoEntity.FindDescendantComponents(Sounds.MSS_Ship_Beam)):
+            BeamSound.Stop()
 
     # One instance of this task runs per walking enemy, parked until that
     # enemy's journey to the pasture ends. Launched by MoveEnemyToPasture.
