@@ -3,6 +3,12 @@
 # the module before you can reference its names.
 using { /Fortnite.com/Devices }                     # button_device, creative_device
 using { /Fortnite.com/Characters }                  # fort_character, GetFortCharacter
+using { /UnrealEngine.com/ControlInput }            # GetPlayerInput, player_input, input_events
+# Imported at the SUBMODULE level, not as /Fortnite.com/Input. That is deliberate:
+# this form brings in the module's members (Reload, WeaponPrimary, RangedWeaponMapping
+# ...) without bringing in the name `Character`, which would otherwise collide with the
+# local `Character` that TryUfoAttack binds for the fort_character.
+using { /Fortnite.com/Input/Character }             # Reload
 using { /Verse.org/Simulation }                     # agent (a player/AI actor)
 using { /Verse.org/SceneGraph }                     # entity, GetSimulationEntity, AddEntities
 # CAREFUL: two incompatible SpatialMath modules exist in UEFN.
@@ -712,6 +718,10 @@ wave_manager := class(creative_device):
         DamageButton.InteractedWithEvent.Subscribe(OnDamagePressed)
         UfoButton.InteractedWithEvent.Subscribe(OnUfoPressed)
 
+        # Second trigger for the same attack: a key. The button above stays wired on
+        # purpose - see WireUfoKeyForPlayers.
+        WireUfoKeyForPlayers()
+
     # Removes the enemies of the previous wave from the world and forgets them.
     #
     # Called by StartWave before every spawn, so one wave's leftovers can never
@@ -1414,6 +1424,77 @@ wave_manager := class(creative_device):
     # branch is new; everything under `TryUfoAttack` is the previous version of this
     # handler, extracted whole so that adding the gate needed no re-indentation of
     # working code and no second level of nesting in one function.
+    # Wires the Reload key to the UFO attack for every player already in the game.
+    #
+    # WHY A KEY CANNOT BE A DEDICATED KEY. Both `input_action` and `input_mapping` are
+    # `epic_internal` in the digest, so Verse cannot construct either, and the project's
+    # Assets digest exposes no input assets, so the editor cannot author one either.
+    # Every bindable action in the whole SDK belongs to Epic: Reload, WeaponPrimary,
+    # WeaponSecondary, Crouch, Sprint, Jump, plus menu-only actions. So the ability
+    # rides on an existing action rather than getting its own.
+    #
+    # RELOAD IS THE LEAST INTRUSIVE ONE AVAILABLE. Nothing in this project ever gives
+    # the player a weapon, and reloading without one does nothing observable. The day
+    # a weapon appears, pressing R will both reload and call the UFO - that coupling is
+    # unavoidable without an action of our own, and there is no way to get one.
+    #
+    # PER PLAYER, NOT GLOBAL, and that is the real structural difference from the
+    # button. GetPlayerInput takes a player, so there is nothing to subscribe until
+    # players exist. This wires the ones present at OnBegin only; players who join
+    # later are a separate step (PlayerAddedEvent) and do not matter while this is
+    # single-player.
+    WireUfoKeyForPlayers() : void =
+        var WiredCount : int = 0
+
+        for (CurrentPlayer : GetPlayspace().GetPlayers()):
+            if:
+                # Failable per the digest, so a player whose input is unavailable is
+                # skipped rather than crashing the wiring for everyone else.
+                PlayerInput := GetPlayerInput[CurrentPlayer]
+            then:
+                # Reload comes from the `using` on /Fortnite.com/Input/Character at the
+                # top of the file. The qualified form `(/Fortnite.com/Input/Character:)Reload`
+                # does NOT resolve here - the compiler asks for the using explicitly -
+                # and importing the submodule turned out to be safe anyway: it brings
+                # in the module's members, not the name `Character`.
+                ReloadEvents : input_events(logic) = PlayerInput.GetInputEvents(Reload)
+                ReloadEvents.ActivationTriggeredEvent.Subscribe(OnUfoKeyPressed)
+
+                set WiredCount += 1
+            else:
+                # NOT SILENT, deliberately. "The key does nothing" is miserable to
+                # debug from an empty log, and this is the one failure that produces
+                # exactly that symptom.
+                Print("WARNING: could not get player input for a player - the UFO key will not work for them")
+
+        Print("UFO key wired to Reload for {WiredCount} player(s) - the UFO button still works too")
+
+    # Runs when a wired player presses Reload.
+    #
+    # THE PAYLOAD IS A TUPLE. ActivationTriggeredEvent is a
+    # `listenable(tuple(player, t))`, and for Reload - an `input_action(logic)` - that
+    # is `tuple(player, logic)`. This is declared as two parameters rather than one
+    # tuple parameter because in Verse a parameter list IS a tuple, so this signature
+    # already has the type the Subscribe callback wants. If the compiler disagrees, the
+    # fallback is a single `Payload : tuple(player, logic)` parameter read with
+    # `Payload(0)`.
+    #
+    # `player` derives from `agent` in the digest, so it flows straight into the
+    # existing handler with no conversion and no change to the attack.
+    #
+    # IT ENTERS THROUGH OnUfoPressed, NOT TryUfoAttack, and that distinction matters:
+    # the cooldown gate lives in OnUfoPressed. Calling the attack directly would give
+    # the key an ability the button does not have - firing with no cooldown at all.
+    # Both triggers go through the same door so they cannot drift apart.
+    # InputValue is received and not used. It has to stay in the signature - that is
+    # what makes this match tuple(player, logic) - but it cannot be logged: there is no
+    # ToString overload for `logic`, so interpolating it does not compile. It carries no
+    # information worth converting here anyway, since ActivationTriggeredEvent only
+    # fires when the input has already succeeded.
+    OnUfoKeyPressed(InPlayer : player, InputValue : logic) : void =
+        Print("UFO key pressed")
+        OnUfoPressed(InPlayer)
+
     OnUfoPressed(InAgent : agent) : void =
         Now : float = GetSimulationElapsedTime()
 
@@ -1438,82 +1519,41 @@ wave_manager := class(creative_device):
             # says it "fails if InAgent is not a fort_character" - so a press from
             # anything that is not a live player simply does nothing.
             Character := InAgent.GetFortCharacter[]
-
-            SimulationEntity := GetSimulationEntity[]
         then:
-            # Built FROM the character's own transform rather than from scratch,
-            # which is what the example does too. A `transform` literal given only a
-            # Translation would take the DEFAULT for Scale - a zero vector - and it
-            # is not documented whether that would collapse the query volume. Taking
-            # a known-good transform and overwriting what we mean to change avoids
-            # having to find out.
+            # THE ATTACK NO LONGER KILLS ANYTHING HERE. Up to sub-step 2 this function
+            # ran the area query and applied lethal damage on the spot, and the UFO was
+            # a flourish over an already-empty stage. Now the query, the damage and the
+            # ship all live in RunUfoAbduction, in that order and spread over time, so
+            # the cows die when the beam has finished lifting them rather than the
+            # instant the button is pressed.
             #
-            # fort_character inherits `positional`, so GetGlobalTransform() hands
-            # back LUF directly. This is the whole reason the un-aimed version is the
-            # safe first step: there is no classic-to-LUF conversion anywhere in it.
-            var QueryTransform : transform = Character.GetGlobalTransform()
+            # What is left here is what has to happen synchronously with the press:
+            # work out WHERE, and charge the cooldown.
+            #
+            # Built FROM the character's own transform rather than from scratch, which
+            # is what the example does too. A `transform` literal given only a
+            # Translation would take the DEFAULT for Scale - a zero vector - and it is
+            # not documented whether that would collapse the query volume. Taking a
+            # known-good transform and overwriting what we mean to change avoids having
+            # to find out.
+            #
+            # fort_character inherits `positional`, so GetGlobalTransform() hands back
+            # LUF directly. This is the whole reason the un-aimed version is the safe
+            # first step: there is no classic-to-LUF conversion anywhere in it.
+            var GroundTransform : transform = Character.GetGlobalTransform()
 
             # Scale forced to unit so UfoRadius means centimeters and nothing else.
             # Inheriting the player's scale would silently multiply the radius.
-            set QueryTransform.Scale = vector3{ Left := 1.0, Up := 1.0, Forward := 1.0 }
+            set GroundTransform.Scale = vector3{ Left := 1.0, Up := 1.0, Forward := 1.0 }
 
-            QuerySphere : collision_sphere = collision_sphere{ Radius := UfoRadius }
-
-            # Counted separately on purpose, because the two numbers fail in
-            # different ways. TotalHits counts EVERYTHING the query returned -
-            # ground, props, the lot. CowsHit counts what survived the cast.
+            # ONE transform is passed, not two. RunUfoAbduction derives the ship's
+            # hover point from this, which is what guarantees the ship is exactly above
+            # the area it is emptying - they cannot drift apart because there is only
+            # one source for both.
             #
-            # That distinction is the diagnostic: cows but no hits means the area is
-            # empty or too small, while ZERO hits of any kind points at the query
-            # itself - a Queryable flag turned off, or a radius of nothing.
-            var TotalHits : int = 0
-            var CowsHit : int = 0
-
-            for (Overlap : SimulationEntity.FindOverlapHits(QueryTransform, QuerySphere)):
-                set TotalHits += 1
-
-                # The cast IS the filter, exactly as in the example: SM_Toy_Cow is the
-                # generated class for the cow's mesh component, so a component that
-                # casts to it belongs to a cow and nothing else. `.Entity` then walks
-                # back from the component to the cow itself.
-                #
-                # THE SAME COW CAN COME BACK MORE THAN ONCE - one hit per overlapping
-                # volume - and that needs no handling here. ApplyDamage's
-                # `CurrentHealth > 0.0` guard makes the second hit a no-op and stops
-                # EliminatedEvent firing twice, which is the same guard that already
-                # protects the damage button walking a list full of corpses.
-                if:
-                    CowMesh := Meshes.SM_Toy_Cow[Overlap.TargetComponent]
-                    HealthComp := CowMesh.Entity.GetComponent[health_component]
-                then:
-                    set CowsHit += 1
-                    HealthComp.ApplyDamage(UfoKillDamage)
-
-            Print("UFO attack - {CowsHit} cows abducted within {UfoRadius} cm ({TotalHits} total overlaps, {LiveEnemyCount} enemies still alive)")
-
-            # Send the ship in. PURELY PRESENTATION IN THIS SUB-STEP: the cows above
-            # are already dead by the time this runs, so the UFO is a flourish over an
-            # empty stage. Sub-step 3 is what moves the killing into the choreography.
-            #
-            # The hover point is the query's own transform lifted straight up, so the
-            # ship is always exactly above whatever the attack hit. Copied into a new
-            # var rather than mutating QueryTransform, which the query above still
-            # owns - and written as a full assignment rather than `+=` because that is
-            # the form the example proves for a nested struct field.
-            var HoverTransform : transform = QueryTransform
-            set HoverTransform.Translation.Up = HoverTransform.Translation.Up + UfoHoverHeightCm
-
-            # The ship's own size, overwriting the unit scale inherited from
-            # QueryTransform. Safe to change here BECAUSE this is a copy: the query
-            # above already ran against QueryTransform's unit scale, so UfoRadius still
-            # means centimeters and nothing about the area changed.
-            set HoverTransform.Scale = vector3{ Left := UfoScale, Up := UfoScale, Forward := UfoScale }
-
             # WaveGeneration is captured NOW, by value, so the task carries the wave it
-            # belongs to. Unused in this sub-step beyond its log line; it is here so
-            # sub-step 3 can add the "is my wave still current" guard without changing
-            # this signature or this call.
-            spawn { RunUfoAbduction(HoverTransform, WaveGeneration) }
+            # belongs to and can tell whether that wave is still current when it wakes.
+            spawn { RunUfoAbduction(GroundTransform, WaveGeneration) }
 
             # Arm the cooldown: one assignment, no task, nothing to clean up later.
             #
@@ -1547,10 +1587,17 @@ wave_manager := class(creative_device):
     # The one `if` that does wrap the ending is the simulation-entity lookup, and that
     # is not the same hazard: if it fails, no ship was ever created, so there is
     # nothing left behind to clean up.
-    RunUfoAbduction(HoverTransform : transform, Generation : int)<suspends> : void =
+    RunUfoAbduction(GroundTransform : transform, Generation : int)<suspends> : void =
         if:
             SimulationEntity := GetSimulationEntity[]
         then:
+            # The ship's hover point: the attack's own ground centre lifted straight
+            # up, so it is always exactly above the area it empties. Derived here
+            # rather than passed in so the two cannot disagree.
+            var HoverTransform : transform = GroundTransform
+            set HoverTransform.Translation.Up = HoverTransform.Translation.Up + UfoHoverHeightCm
+            set HoverTransform.Scale = vector3{ Left := UfoScale, Up := UfoScale, Forward := UfoScale }
+
             # Same three-line spawn the wave loop uses for cows: instantiate the
             # prefab, put it in the world, then place it. AddEntities has to come
             # first - until then the prefab exists but its components are not in the
@@ -1602,10 +1649,105 @@ wave_manager := class(creative_device):
 
             Print("UFO arrived {UfoHoverHeightCm} cm above the target (wave generation {Generation})")
 
-            # One wait for the whole visit, derived from the two dials so the ship's
-            # time on screen and the cows' rise cannot drift apart once sub-step 3
-            # gives the cows something to do.
-            Sleep(UfoRiseSeconds + UfoBeamLingerSeconds)
+            # The cows caught in the beam, remembered so they can be killed once the
+            # rise has finished. Declared out here, OUTSIDE the guard below, so the
+            # damage pass and the cleanup that follow always have something valid to
+            # walk even when the query never ran.
+            var AbductedCows : []entity = array{}
+
+            # THE GENERATION GUARD SKIPS THE QUERY, NEVER THE ENDING. If the run ended
+            # or the wave moved on between the press and this line, the ship still
+            # appears and still leaves - a half-second of harmless theatre - but it
+            # takes nobody with it. Both branches fall through to the Sleep below.
+            #
+            # Same pair of conditions the drain loop uses, and for the same reason:
+            # the generation catches a new wave and the defeat's bump, the latch
+            # catches either ending.
+            if:
+                Generation = WaveGeneration
+                not RunHasEnded?
+            then:
+                QuerySphere : collision_sphere = collision_sphere{ Radius := UfoRadius }
+
+                # Counted separately on purpose, because the two numbers fail in
+                # different ways. TotalHits counts EVERYTHING the query returned -
+                # ground, props, the lot. AbductedCows counts what survived the cast
+                # and the filters.
+                #
+                # That distinction is the diagnostic: cows but no hits means the area
+                # is empty or too small, while ZERO hits of any kind points at the
+                # query itself - a Queryable flag turned off, or a radius of nothing.
+                var TotalHits : int = 0
+
+                for (Overlap : SimulationEntity.FindOverlapHits(GroundTransform, QuerySphere)):
+                    set TotalHits += 1
+
+                    if:
+                        # The cast IS the filter, exactly as in the example: SM_Toy_Cow
+                        # is the generated class for the cow's mesh component, so a
+                        # component that casts to it belongs to a cow and nothing else.
+                        # `.Entity` then walks back from the component to the cow.
+                        CowMesh := Meshes.SM_Toy_Cow[Overlap.TargetComponent]
+                        CowEntity := CowMesh.Entity
+
+                        # Skip cows that are already out of the fight. A sedated cow is
+                        # parented and healthy-looking to a query but has 0 health, and
+                        # watching a flattened body float up would read as a bug. It
+                        # would also be pointless: the counter already forgot it.
+                        CowHealthComp := CowEntity.GetComponent[health_component]
+                        CowHealthComp.CurrentHealth > 0.0
+
+                        # DEDUPLICATION, and the reason it is needed: the digest says a
+                        # mesh target reports one hit per overlapping collision element,
+                        # so a single cow can come back many times from one query. Two
+                        # rise animations on one cow means the second SetKeyframes
+                        # rebases mid-flight and the cow visibly jumps.
+                        #
+                        # The interactable does double duty as the marker. It has to be
+                        # switched off anyway - a cow being carried away must not still
+                        # offer a "sedate me" prompt - so its enabled state is exactly
+                        # "this cow has not been processed yet". IsEnabled is failable,
+                        # so a second hit on the same cow simply fails this line.
+                        #
+                        # A cow with no interactable at all is skipped entirely. That
+                        # only happens on the path that already logs a warning at spawn
+                        # time, so it is a known-broken cow rather than a new hole.
+                        CowInteractableComp := CowEntity.GetComponent[interactable_component]
+                        CowInteractableComp.IsEnabled[]
+                    then:
+                        CowInteractableComp.Disable()
+                        set AbductedCows += array{ CowEntity }
+                        StartCowRise(CowEntity, HoverTransform.Translation)
+
+                Print("UFO beam caught {AbductedCows.Length} cows within {UfoRadius} cm ({TotalHits} total overlaps)")
+            else:
+                Print("UFO beam caught nothing - its wave moved on or the run ended before it arrived")
+
+            # THE RISE. One wait for every cow, and the same UfoRiseSeconds that each
+            # cow's keyframe was given as its Duration - so the ship cannot leave
+            # before they arrive, by construction rather than by tuning two numbers to
+            # match.
+            Sleep(UfoRiseSeconds)
+
+            # NOW they die, and by the ordinary route. ApplyDamage fires
+            # EliminatedEvent, WatchEnemyDeath sees a cow that is not sedated and calls
+            # RemoveFromParent, and OnEnemyDied decrements the counter - none of which
+            # knows the UFO exists. The bodies vanish at the top of the beam, which is
+            # where they visually belong.
+            #
+            # NOT generation-guarded, deliberately. If the wave turned over during the
+            # rise, ClearCurrentWave has already detached these cows; ApplyDamage then
+            # fires an EliminatedEvent whose OnEnemyDied is stamped with the old
+            # generation and discarded by the guard that already exists there. Adding a
+            # second guard here would duplicate a decision that is already made
+            # correctly one level down.
+            for (AbductedCow : AbductedCows):
+                if (AbductedHealthComp := AbductedCow.GetComponent[health_component]):
+                    AbductedHealthComp.ApplyDamage(UfoKillDamage)
+
+            # The beam holds a moment longer than the cows, so it does not cut out on
+            # the same frame the last one disappears.
+            Sleep(UfoBeamLingerSeconds)
 
             # Beam off before the ship goes. Strictly speaking redundant - the
             # RemoveFromParent below cascades and destroys these components anyway -
@@ -1622,6 +1764,65 @@ wave_manager := class(creative_device):
             Print("UFO left")
         else:
             Print("WARNING: no simulation entity available - cannot spawn the UFO")
+
+    # Starts one cow floating up towards the ship. Returns immediately - the flight
+    # itself is played by the engine.
+    #
+    # ADAPTED FROM THE EXAMPLE'S AbductCow, with two changes.
+    #
+    # FIRST, IT DOES NOT WAIT AND IT DOES NOT SUSPEND. The example ended with
+    # `CowMesh.EntityEnteredEvent.Await()` - an unbounded wait for the cow to touch the
+    # ship, which parks forever if it never does, and this project already carries two
+    # documented parked-task leaks. Replacing it with a Sleep would have fixed the
+    # unboundedness but still cost one task per cow. Handing the keyframes to the
+    # engine and returning costs none: RunUfoAbduction does the single Sleep for all
+    # of them, which is also what makes the ship and the cows share one clock.
+    #
+    # SECOND, IT DOES NOT KILL OR REMOVE THE COW. The example's version finished with
+    # RemoveFromParent, which would bypass health, EliminatedEvent and the live
+    # counter. Here the caller applies ordinary lethal damage when the rise ends and
+    # the existing death pipeline disposes of the body.
+    #
+    # What is kept is the example's flight: the delta from the cow to the ship, the
+    # ease-in curve so it starts slow and accelerates upward, and the cow's own sound.
+    StartCowRise(CowEntity : entity, ShipTranslation : vector3) : void =
+        if:
+            MovementComp := CowEntity.GetComponent[keyframed_movement_component]
+        then:
+            # Keyframes are RELATIVE, so the translation is the difference between the
+            # cow and the ship.
+            #
+            # Scale MUST be all zeros, the same trap MoveEnemyToPasture documents:
+            # translation and scale are applied ADDITIVELY, so leaving Scale at its
+            # default would grow the cow all the way up. Rotation is left alone, so the
+            # cow rises upright rather than tumbling.
+            #
+            # SetKeyframes destroys whatever path this component was holding, which
+            # here is the walk to the pasture. That is fine and intended - the cow is
+            # leaving - but it is also irreversible: a cow whose abduction was somehow
+            # interrupted would be left with no route and would simply stand still.
+            # One more reason RunUfoAbduction must never abort half way.
+            RiseDelta : transform = transform:
+                Translation := ShipTranslation - CowEntity.GetGlobalTransform().Translation
+                Scale := vector3{ Left := 0.0, Up := 0.0, Forward := 0.0 }
+
+            # The Duration IS UfoRiseSeconds, the same field the caller sleeps on.
+            # Ease-in because a tractor beam should take hold gently and then pull.
+            RiseKeyframe : keyframed_movement_delta = keyframed_movement_delta:
+                Transform := RiseDelta
+                Duration := UfoRiseSeconds
+                Easing := ease_in_cubic_bezier_easing_function{}
+
+            MovementComp.SetKeyframes(array{ RiseKeyframe }, oneshot_keyframed_movement_playback_mode{})
+            MovementComp.Play()
+
+            # The cow's own sound component - MSS_Cow_Upset, four moo variations. It is
+            # already on every P_Cow, so an abducted cow complains on the way up for
+            # free. Optional in the sense that a cow without one still flies.
+            if (CowSoundComp := CowEntity.GetComponent[sound_component]):
+                CowSoundComp.Play()
+        else:
+            Print("WARNING: a cow caught in the beam has no keyframed_movement_component - it will die in place instead of rising")
 
     # Lights the abduction beam on a spawned UFO: the beam mesh, the spot light and
     # the beam sound.
@@ -2167,6 +2368,40 @@ wave_manager := class(creative_device):
                     # announce a defeat straight after the win.
                     set RunHasEnded = true
                     Print("All {MaxWaves} waves survived - you win!")
+
+                    # Sweep the field, so a win leaves it as empty as a loss does.
+                    #
+                    # WHY THIS WAS MISSING AND WHY IT SHOWS. "Wave cleared" means
+                    # LiveEnemyCount reached zero, and a SEDATED cow reaches zero
+                    # without leaving the world - that is the whole point of the
+                    # flag. So on the final wave every cow the player put to sleep
+                    # was still lying in the field after the win, flattened, while
+                    # the defeat path had been sweeping them all along. This is the
+                    # same call, on the other ending.
+                    #
+                    # ORDER MATTERS AND MIRRORS THE DEFEAT PATH: latch, announce,
+                    # then sweep. RunHasEnded is already true by the time a single
+                    # entity leaves the scene, so nothing the sweep disturbs can
+                    # re-enter this function - OnEnemyDied's own `not RunHasEnded?`
+                    # guard turns any late death into a no-op.
+                    #
+                    # IT CANNOT RE-TRIGGER WAVE LOGIC. RemoveFromParent does not
+                    # signal EliminatedEvent, and OnEnemyDied is only ever reached
+                    # through that event, so removing bodies announces nothing.
+                    #
+                    # IT CANNOT UNBALANCE THE COUNTER. ClearCurrentWave assigns
+                    # LiveEnemyCount = 0, and we are inside the `<= 0` branch, so
+                    # the assignment is either a no-op or it normalises a count that
+                    # had gone negative. Either way it cannot go out of step.
+                    #
+                    # NO GENERATION BUMP HERE, unlike defeat. Defeat bumps because
+                    # it can strike with a wave fully alive and a ChainNextWave
+                    # sleeping, and the stamp invalidates both in one stroke. At
+                    # victory there is nothing of the sort in flight - the wave is
+                    # cleared by definition and the chaining task is on the other
+                    # branch of this `if` - and RunHasEnded is the stronger latch
+                    # that every one of those guards checks anyway.
+                    ClearCurrentWave()
                 else:
                     # Hand the wait to a separate task so THIS function stays
                     # non-suspending. Sleeping inline would put a suspension
