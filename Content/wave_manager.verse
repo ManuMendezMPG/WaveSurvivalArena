@@ -117,6 +117,12 @@ SedateCowPrompt<localizes> : message = "Stay still to sedate"
 # Concatenate and Err. `Current` is safe - no such identifier exists in any digest.
 CropHealthDisplay<localizes>(Current : int, MaxValue : int) : message = "Crop: {Current} / {MaxValue}"
 
+# The wave counter shown on the HUD. Same shape as the crop readout above, and
+# `MaxValue` rather than `Max` for the same reason - see that comment.
+#
+# No rounding needed at the call site here: both wave numbers are already ints.
+WaveDisplay<localizes>(Current : int, MaxValue : int) : message = "Wave: {Current} / {MaxValue}"
+
 # One instance of this per living enemy. It exists for exactly one reason: to
 # answer "which cow was that?" when an interaction succeeds.
 #
@@ -717,6 +723,17 @@ wave_manager := class(creative_device):
     # when PlayerAddedEvent arrives.
     var CropHealthText : ?text_block = false
 
+    # The HUD text showing the wave counter. Same reasoning as CropHealthText above,
+    # including the one-field limit: with two players only the last one wired would ever
+    # be updated.
+    #
+    # A SECOND WIDGET RATHER THAN A SECOND LINE IN THE FIRST ONE, on purpose. They change
+    # at completely different moments - the crop several times a second while a cow
+    # grazes, the wave once every twenty seconds or so - and one widget would mean
+    # rebuilding both strings on every crop tick. It also means the canvas step later can
+    # place them independently.
+    var WaveNumberText : ?text_block = false
+
     # EVERYTHING spawned in the current wave, alive or dead. This is NOT the
     # live-enemy list: dead enemies stay in here until the whole wave is
     # cleared. Its only job is to give ClearCurrentWave something to sweep, and
@@ -1188,6 +1205,12 @@ wave_manager := class(creative_device):
         set CurrentWaveNumber = WaveNumber
         ThisGeneration : int = WaveGeneration
 
+        # The HUD's only wave update. Placed immediately after the assignment above -
+        # the single place in this file that writes CurrentWaveNumber - so the readout
+        # cannot disagree with the number the rest of the function is about to use.
+        # Cosmetic and additive; see UpdateWaveHud.
+        UpdateWaveHud()
+
         # 3. Derive the size from the wave number rather than accumulating it in
         #    a variable: wave 1 -> EnemiesPerWave, and each wave after adds
         #    EnemiesIncrementPerWave. Pure integer arithmetic, and re-tuning the
@@ -1500,6 +1523,7 @@ wave_manager := class(creative_device):
                 PlayerUI := GetPlayerUI[CurrentPlayer]
             then:
                 NewCropText : text_block = text_block{}
+                NewWaveText : text_block = text_block{}
 
                 # THE SLOT IS THE WHOLE REASON THIS IS NOT THE ONE-ARGUMENT AddWidget.
                 #
@@ -1509,27 +1533,42 @@ wave_manager := class(creative_device):
                 # reach the UFO. The digest does not state what the default is, so it is
                 # passed EXPLICITLY rather than assumed.
                 #
-                # ZOrder is left at its default: with one widget there is nothing to
-                # order it against.
+                # ONE SLOT VALUE REUSED FOR BOTH WIDGETS. player_ui_slot is a struct, so
+                # passing it twice passes a copy twice - the two widgets do not end up
+                # sharing anything. And they must not disagree about InputMode: a single
+                # widget set to All would be enough to eat the R key.
+                #
+                # ZOrder is left at its default for both, which is why they will land on
+                # top of each other. Separating them is the canvas step.
                 HudSlot : player_ui_slot = player_ui_slot:
                     InputMode := ui_input_mode.None
 
                 PlayerUI.AddWidget(NewCropText, HudSlot)
+                PlayerUI.AddWidget(NewWaveText, HudSlot)
 
                 set CropHealthText = option{ NewCropText }
+                set WaveNumberText = option{ NewWaveText }
                 set AddedCount += 1
             else:
                 # NOT SILENT, for the same reason the input wiring is not: "the HUD
                 # never appeared" is a horrible thing to debug from an empty log.
-                Print("WARNING: could not get player UI for a player - they will not see the crop readout")
+                Print("WARNING: could not get player UI for a player - they will not see the HUD")
 
-        # The starting value, written now rather than through DefaultText on the widget.
+        # The starting values, written now rather than through DefaultText on the widgets.
         # DefaultText is documented as "used only during initialization and not modified
-        # by SetText", so having one code path that always writes the text - this one -
+        # by SetText", so having one code path that always writes each text - these two -
         # avoids two places that can disagree about what the HUD says.
+        #
+        # THE WAVE STARTS AT ITS REAL VALUE, WHICH IS 0. CurrentWaveNumber is 0 until
+        # StartWave runs, so the HUD opens on "Wave: 0 / 5". That is deliberate rather
+        # than lazy: no run is in progress before Start is pressed, and showing "Wave: 1"
+        # would claim a wave is running when none is. It is also exactly how the crop
+        # readout already behaves - it shows "Crop: 0 / 100" before Start for the same
+        # reason, because CropHealth is 0 until the run begins.
         UpdateCropHealthHud()
+        UpdateWaveHud()
 
-        Print("Crop HUD added for {AddedCount} player(s)")
+        Print("HUD added for {AddedCount} player(s)")
 
     # Re-writes the crop readout from whatever CropHealth currently is.
     #
@@ -1551,6 +1590,22 @@ wave_manager := class(creative_device):
             CropText := CropHealthText?
         then:
             CropText.SetText(CropHealthDisplay(CurrentCrop, MaxCrop))
+
+    # Re-writes the wave counter. The crop readout's sibling, and simpler than it: both
+    # numbers are already ints, so the widget reference is the only failable part.
+    #
+    # ONE CALL SITE IS ENOUGH, and that is a property of the game rather than a shortcut.
+    # `set CurrentWaveNumber` appears exactly once in this file - in StartWave - so every
+    # route that changes the wave passes through there: the Start button via StartWave(1),
+    # and the automatic chaining via ChainNextWave. Calling this from OnStartPressed as
+    # well would be worse than redundant: the reset block there runs BEFORE StartWave(1),
+    # so it would briefly draw the previous run's wave number.
+    #
+    # Failing is a no-op, same as the crop version: a HUD that cannot be written is a
+    # cosmetic problem and must never interrupt the wave logic that called it.
+    UpdateWaveHud() : void =
+        if (WaveText := WaveNumberText?):
+            WaveText.SetText(WaveDisplay(CurrentWaveNumber, MaxWaves))
 
     # Wires the Reload key to the UFO attack for every player already in the game.
     #
