@@ -28,6 +28,20 @@ using { /Verse.org/SpatialMath }                    # transform, vector3 (LUF), 
 using { /Verse.org/Random }                         # GetRandomFloat
 using { /Verse.org/Verse }                          # Min, Max, Sin
 using { /UnrealEngine.com/Temporary/Diagnostics }   # Print
+# The two UI modules, and both are needed: /Fortnite.com/UI has text_block while
+# player_ui, GetPlayerUI, player_ui_slot and ui_input_mode all live in the other. The
+# Fortnite one `using`s the UnrealEngine one internally, but Verse usings are not
+# transitive, so importing it here does not import them here.
+#
+# NOTE the `Temporary` in the second path. It is the same kind of transitional
+# namespace as /UnrealEngine.com/Temporary/SpatialMath, so this API may move.
+#
+# It does NOT drag classic SpatialMath into this file. The UI module uses classic
+# vector2/vector3 internally, but because usings are not transitive the bare `vector3`
+# in this file still means the LUF one. That matters here more than usual - mixing the
+# two is a trap this project has already hit once.
+using { /Fortnite.com/UI }                          # text_block
+using { /UnrealEngine.com/Temporary/UI }            # GetPlayerUI, player_ui, player_ui_slot, ui_input_mode
 
 # An axis-aligned rectangular area of the world, in Scene Graph LUF
 # centimeters. Held as min/max per axis rather than centre+size because that is
@@ -84,6 +98,24 @@ spawn_zone := struct:
 # controller and duplicated on a keyboard - and "hold" would describe a keypress
 # the mechanic does not actually require.
 SedateCowPrompt<localizes> : message = "Stay still to sedate"
+
+# The crop readout shown on the HUD.
+#
+# A `<localizes>` FUNCTION WITH PARAMETERS, not a plain field like the prompt above.
+# text_base.SetText takes a `message` and nothing else - there is no string overload -
+# so a value that changes has to arrive through a message built at call time, and this
+# is the shape that does it.
+#
+# INTS, NOT FLOATS. Crop health is a float internally, and interpolating one here would
+# print "80.000000". The caller rounds before calling, which also sidesteps the question
+# of whether a float interpolates into a message at all.
+#
+# `MaxValue` AND NOT `Max`: this file imports /Verse.org/Verse for Min/Max/Sin, and a
+# parameter called Max makes the interpolation below ambiguous between the parameter and
+# the standard function. The other single-name functions worth avoiding as parameter
+# names here are Min, Abs, Round, Int, Clamp, Floor, Ceil, Sin, Cos, Tan, Sqrt, ToString,
+# Concatenate and Err. `Current` is safe - no such identifier exists in any digest.
+CropHealthDisplay<localizes>(Current : int, MaxValue : int) : message = "Crop: {Current} / {MaxValue}"
 
 # One instance of this per living enemy. It exists for exactly one reason: to
 # answer "which cow was that?" when an interaction succeeds.
@@ -673,6 +705,18 @@ wave_manager := class(creative_device):
     # case that cannot arise yet. It is the one thing here that multiplayer changes.
     var UfoReadyAt : float = 0.0
 
+    # The HUD text showing the crop's health, kept so it can be re-written later.
+    #
+    # A widget has no "find me again" lookup, so the only way to call SetText after
+    # AddWidget is to have held on to the instance. Optional because there is nothing to
+    # hold until a player exists and WireCropHudForPlayers runs.
+    #
+    # ONE FIELD, NOT ONE PER PLAYER, which is the accepted limit of this step. With two
+    # players both would get a widget but only the last one created would ever update.
+    # Multiplayer wants a map keyed by player, the same shape the input wiring will need
+    # when PlayerAddedEvent arrives.
+    var CropHealthText : ?text_block = false
+
     # EVERYTHING spawned in the current wave, alive or dead. This is NOT the
     # live-enemy list: dead enemies stay in here until the whole wave is
     # cleared. Its only job is to give ClearCurrentWave something to sweep, and
@@ -721,6 +765,10 @@ wave_manager := class(creative_device):
         # Second trigger for the same attack: a key. The button above stays wired on
         # purpose - see WireUfoKeyForPlayers.
         WireUfoKeyForPlayers()
+
+        # Put the crop readout on screen. After the key wiring, so if the UI ever
+        # interfered with input the log order would make that obvious.
+        WireCropHudForPlayers()
 
     # Removes the enemies of the previous wave from the world and forgets them.
     #
@@ -778,6 +826,9 @@ wave_manager := class(creative_device):
         # wave-scoped. Those two lifetimes reset in two different places.
         set CropHealth = CropMaxHealth
         Print("Crop restored to {CropHealth} health")
+
+        # HUD change 1 of 2. Cosmetic and additive - see UpdateCropHealthHud.
+        UpdateCropHealthHud()
 
         # Unlatch, so a run that ended in victory or defeat can be played again.
         # StartWave deliberately has no precondition, so it does not matter how
@@ -1424,6 +1475,83 @@ wave_manager := class(creative_device):
     # branch is new; everything under `TryUfoAttack` is the previous version of this
     # handler, extracted whole so that adding the gate needed no re-indentation of
     # working code and no second level of nesting in one function.
+    # Puts the crop readout on screen for every player already in the game.
+    #
+    # SAME SHAPE AS WireUfoKeyForPlayers, because the UI has the same constraint the
+    # input does: GetPlayerUI takes a player, so there is nothing to add until players
+    # exist. Kept as a separate function and a separate loop rather than folded into the
+    # input one - they cost nothing apart and it means a failure in one cannot take the
+    # other down with it.
+    #
+    # Players who join later get nothing. That is the same gap the input wiring has and
+    # the same fix (PlayerAddedEvent), deferred for the same reason: single-player.
+    #
+    # NO CANVAS. AddWidget's one-argument form places the widget with a default slot
+    # configuration, which is enough to prove the pipeline works. Putting it in a corner
+    # needs a canvas and MakeCanvasSlot, and that is a separate step.
+    WireCropHudForPlayers() : void =
+        var AddedCount : int = 0
+
+        for (CurrentPlayer : GetPlayspace().GetPlayers()):
+            if:
+                # Failable per the digest - "fails if there is no player_ui associated
+                # with Player" - so a player without one is skipped rather than taking
+                # the loop down.
+                PlayerUI := GetPlayerUI[CurrentPlayer]
+            then:
+                NewCropText : text_block = text_block{}
+
+                # THE SLOT IS THE WHOLE REASON THIS IS NOT THE ONE-ARGUMENT AddWidget.
+                #
+                # ui_input_mode has two values, None and All, and All means the widget
+                # "consumes all inputs". A HUD readout that swallowed input would kill
+                # the Reload key wired a few lines below this - the R press would never
+                # reach the UFO. The digest does not state what the default is, so it is
+                # passed EXPLICITLY rather than assumed.
+                #
+                # ZOrder is left at its default: with one widget there is nothing to
+                # order it against.
+                HudSlot : player_ui_slot = player_ui_slot:
+                    InputMode := ui_input_mode.None
+
+                PlayerUI.AddWidget(NewCropText, HudSlot)
+
+                set CropHealthText = option{ NewCropText }
+                set AddedCount += 1
+            else:
+                # NOT SILENT, for the same reason the input wiring is not: "the HUD
+                # never appeared" is a horrible thing to debug from an empty log.
+                Print("WARNING: could not get player UI for a player - they will not see the crop readout")
+
+        # The starting value, written now rather than through DefaultText on the widget.
+        # DefaultText is documented as "used only during initialization and not modified
+        # by SetText", so having one code path that always writes the text - this one -
+        # avoids two places that can disagree about what the HUD says.
+        UpdateCropHealthHud()
+
+        Print("Crop HUD added for {AddedCount} player(s)")
+
+    # Re-writes the crop readout from whatever CropHealth currently is.
+    #
+    # THE ONLY PLACE THAT TOUCHES THE HUD TEXT, called from the two - and only two -
+    # places in this file where CropHealth changes: the reset in OnStartPressed and the
+    # subtraction in DrainCropWhileAtPasture. No polling loop, no tick: the value cannot
+    # change without one of those running.
+    #
+    # Everything failable is gathered here so the two call sites stay single lines.
+    # Round is <decides> - it can fail on a value that is not finite - and the widget
+    # reference is an optional that is empty until a player has been wired.
+    #
+    # Failing is a no-op on purpose: a HUD that cannot be written is a cosmetic problem
+    # and must never interrupt the crop logic that called it.
+    UpdateCropHealthHud() : void =
+        if:
+            CurrentCrop := Round[CropHealth]
+            MaxCrop := Round[CropMaxHealth]
+            CropText := CropHealthText?
+        then:
+            CropText.SetText(CropHealthDisplay(CurrentCrop, MaxCrop))
+
     # Wires the Reload key to the UFO attack for every player already in the game.
     #
     # WHY A KEY CANNOT BE A DEDICATED KEY. Both `input_action` and `input_mapping` are
@@ -1715,9 +1843,45 @@ wave_manager := class(creative_device):
                         CowInteractableComp := CowEntity.GetComponent[interactable_component]
                         CowInteractableComp.IsEnabled[]
                     then:
+                        # FOUR OPERATIONS, AND THE ORDER IS LOAD-BEARING.
+                        #
+                        # 1. The flag FIRST, before anything can observe a death. The
+                        #    ApplyDamage at the end of this block signals EliminatedEvent,
+                        #    and health_component's own comment records that the digest
+                        #    does not say whether Signal resumes waiters synchronously. If
+                        #    WatchEnemyDeath ran inside that call with the flag still
+                        #    down, it would take the `else` branch and RemoveFromParent
+                        #    the cow - out of the scene before it had risen an inch.
+                        #
+                        # 2. The prompt off. A cow being carried away must not still offer
+                        #    to be sedated. This also remains the deduplication marker for
+                        #    repeat hits from the same query.
+                        #
+                        # 3. THE RISE BEFORE THE DAMAGE, not just the flag. StartCowRise
+                        #    reads components, reads the live transform and calls
+                        #    SetKeyframes - which rebases the path on that transform - and
+                        #    all of it wants an entity that is still placed and simulating.
+                        #    Handing the keyframes over while the cow is unambiguously
+                        #    alive removes the question entirely.
+                        #
+                        # 4. The damage LAST, which is the whole point of variant B: the
+                        #    cow stops being a threat as the beam takes hold rather than
+                        #    two seconds later. The drain loop and the grazing pulse both
+                        #    fail their `CurrentHealth > 0.0` guard on their next wake, and
+                        #    the live counter drops now.
+                        #
+                        # No suspension point exists between any of the four, so no other
+                        # task can observe a half-applied state.
+                        set CowHealthComp.IsBeingAbducted = true
                         CowInteractableComp.Disable()
-                        set AbductedCows += array{ CowEntity }
                         StartCowRise(CowEntity, HoverTransform.Translation)
+                        CowHealthComp.ApplyDamage(UfoKillDamage)
+
+                        # Remembered so the rise can be cleaned up when it finishes. The
+                        # abduction owns these bodies now - WatchEnemyDeath deliberately
+                        # leaves them alone - so this list is the only thing that will
+                        # ever remove them.
+                        set AbductedCows += array{ CowEntity }
 
                 Print("UFO beam caught {AbductedCows.Length} cows within {UfoRadius} cm ({TotalHits} total overlaps)")
             else:
@@ -1729,21 +1893,25 @@ wave_manager := class(creative_device):
             # match.
             Sleep(UfoRiseSeconds)
 
-            # NOW they die, and by the ordinary route. ApplyDamage fires
-            # EliminatedEvent, WatchEnemyDeath sees a cow that is not sedated and calls
-            # RemoveFromParent, and OnEnemyDied decrements the counter - none of which
-            # knows the UFO exists. The bodies vanish at the top of the beam, which is
-            # where they visually belong.
+            # NOW the bodies go. They died two seconds ago, when the beam took hold -
+            # health, EliminatedEvent, the live counter and the crop all settled then.
+            # What is left is purely disposal, and it belongs here because the third
+            # branch of WatchEnemyDeath deliberately declined to do it: an abducted cow
+            # has to survive long enough to finish rising, so the abduction owns the body
+            # and this is where that ownership ends.
             #
-            # NOT generation-guarded, deliberately. If the wave turned over during the
-            # rise, ClearCurrentWave has already detached these cows; ApplyDamage then
-            # fires an EliminatedEvent whose OnEnemyDied is stamped with the old
-            # generation and discarded by the guard that already exists there. Adding a
-            # second guard here would duplicate a decision that is already made
-            # correctly one level down.
+            # NO ApplyDamage HERE ANY MORE. It used to be the killing blow, applied after
+            # the rise, and that is exactly what let a rising cow keep eating the crop for
+            # UfoRiseSeconds. Its health guard would make a second call harmless, but a
+            # harmless call that looks like the kill would be misleading to read.
+            #
+            # NOT generation-guarded, and it must not be. If the wave turned over during
+            # the rise, ClearCurrentWave already detached these cows and this is a no-op
+            # on each - the same no-op ClearCurrentWave itself performs every wave when it
+            # walks its list of already-dead enemies. A guard here could only skip a
+            # cleanup that must always happen.
             for (AbductedCow : AbductedCows):
-                if (AbductedHealthComp := AbductedCow.GetComponent[health_component]):
-                    AbductedHealthComp.ApplyDamage(UfoKillDamage)
+                AbductedCow.RemoveFromParent()
 
             # The beam holds a moment longer than the cows, so it does not cut out on
             # the same frame the last one disappears.
@@ -1996,6 +2164,12 @@ wave_manager := class(creative_device):
                 # is reported at the two moments that matter instead - when a cow
                 # starts eating and when it stops - plus the game over line.
                 set CropHealth = Max(0.0, CropHealth - CropDamagePerTick)
+
+                # HUD change 2 of 2. Placed immediately after the subtraction and before
+                # the defeat test, so it adds no suspension point and the "no data race"
+                # argument below is untouched: reading CropHealth, writing it, showing it
+                # and testing for defeat all still happen in one uninterrupted stretch.
+                UpdateCropHealthHud()
 
                 # DEFEAT - moved in here unchanged from the old arrival handler.
                 # The `not RunHasEnded?` is belt and braces: guard 2 above already
@@ -2309,14 +2483,29 @@ wave_manager := class(creative_device):
         # Removing from the world happens HERE, at the moment of neutralization,
         # rather than in whatever dealt the damage. Any future damage source gets
         # that behaviour for free.
-        if (HealthComp.IsSedated?):
-            Print("Enemy sedated - it is asleep and no longer a threat, body left standing")
-
-            # The body stays, so make it read as asleep rather than as a cow that
-            # merely stopped walking. Cosmetic only - see ApplySleepFlatten.
-            ApplySleepFlatten(DeadEntity)
+        # THREE OUTCOMES NOW, in strict order of precedence: abduction, then sedation,
+        # then an ordinary death. Abduction is tested FIRST because it is the only one
+        # that must override the others - a cow can be caught by the beam while it is
+        # grazing, and it must neither be flattened nor removed here.
+        #
+        # Written as a nested if/else rather than an `else if` chain because this project
+        # has no precedent for that form and this is not the place to find out.
+        if (HealthComp.IsBeingAbducted?):
+            # DELIBERATELY DOES NOTHING TO THE BODY. RunUfoAbduction owns it: the cow has
+            # to stay in the scene long enough to finish rising into the ship, and that
+            # task removes it when the rise ends. Removing it here would delete the cow
+            # mid-flight - and, because Signal may resume this task synchronously inside
+            # ApplyDamage, possibly before it had moved at all.
+            Print("Enemy taken by the UFO - the beam owns the body until the rise ends")
         else:
-            DeadEntity.RemoveFromParent()
+            if (HealthComp.IsSedated?):
+                Print("Enemy sedated - it is asleep and no longer a threat, body left standing")
+
+                # The body stays, so make it read as asleep rather than as a cow that
+                # merely stopped walking. Cosmetic only - see ApplySleepFlatten.
+                ApplySleepFlatten(DeadEntity)
+            else:
+                DeadEntity.RemoveFromParent()
 
         # Called identically on both paths. The counter, its generation guard, its
         # run-ended latch and the wave/victory decisions are all unchanged: as far

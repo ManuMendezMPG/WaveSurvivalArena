@@ -59,6 +59,31 @@ health_component<public> := class<final_super>(component):
     # in wave_manager, both on digest fields declared exactly this shape.
     var IsSedated<public> : logic = false
 
+    # Marks that this entity reached 0 health because a UFO beam took it, rather than
+    # by being killed or sedated.
+    #
+    # THIS COMPONENT NEVER ACTS ON IT either, exactly like IsSedated above: ApplyDamage
+    # behaves identically, EliminatedEvent fires the same. It is the third answer to the
+    # same question the sedation flag answers - "what should be done with the body" - and
+    # it means "nothing: whoever is abducting it owns it and will remove it when the
+    # animation finishes".
+    #
+    # WHY A THIRD FLAG RATHER THAN REUSING IsSedated: the two outcomes need opposite
+    # treatment. A sedated body stays in the world and gets flattened; an abducted body
+    # must NOT be flattened and must not be removed yet either. Two booleans describing
+    # three outcomes would have to lie about one of them.
+    #
+    # WHAT IT BUYS, and the reason it exists at all: it lets the abduction apply lethal
+    # damage at the START of the rise instead of the end. That makes the cow stop being a
+    # threat the instant the beam grabs it, so the crop-drain loop and the grazing pulse
+    # both fail their `CurrentHealth > 0.0` guard immediately and the live counter drops
+    # at the same moment - all without any of them knowing that abduction exists.
+    #
+    # Set it BEFORE the ApplyDamage that neutralizes the entity, for the same reason
+    # IsSedated must be: Signal may resume waiting tasks synchronously, so the flag has
+    # to already be true when the damage lands.
+    var IsBeingAbducted<public> : logic = false
+
     # Fired once when this entity's health reaches 0. The payload is the entity
     # that died, so a listener knows WHICH enemy it was.
     #
